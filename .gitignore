@@ -1,0 +1,17 @@
+# Reference materials / excluded assets
+gitignore/
+
+# Claude session data
+.claude/
+.claude*
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS
+.DS_Store
+Thumbs.db

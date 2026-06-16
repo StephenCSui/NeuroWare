@@ -1,0 +1,167 @@
+# NeuroWare DEVLOG
+
+---
+
+## Session 1 — NeuroWare (2026-06-14)
+
+### What was done
+- Project defined and scoped via transcript + concept sketches
+- Reviewed reference paper: Yadav et al. "Maintaining the Level of a Payload carried by Multi-Robot System on Irregular Surface" (arXiv:2512.16024v2)
+- Reviewed existing assets: `paper_robot_centered_actuator_v6/` — URDF, SDF, GLB/STL meshes, piston height model Python class
+- Reviewed concept sketches (SVGs) detailing single-unit profile, scissor lift, 3-actuator tilt platform, tactile force plate with load cells
+
+### What worked
+- Existing v6 model is clean: actuator correctly centered, URDF jointed properly, piston height formula implemented and matches the paper
+
+### What did not work
+- N/A (no implementation attempted yet)
+
+### Immediate issues
+- No Isaac Sim (USD) version of the robot model exists yet
+- Mechanical design not started — 3-actuator tilt platform, scissor lift, omni-wheel base are still concept-level
+- No tactile sensing / load cell simulation pipeline yet
+- Swarm coordination layer (mesh communication, shared load/pose) not designed
+
+### Current state
+Early inception. Reference paper implemented in Gazebo/ROS (v6 model). Project is extending this toward Isaac Sim, tactile sensing, and a more capable per-unit tilt mechanism.
+
+### Next steps (high level)
+1. Decide on target robot configuration for first Isaac Sim prototype (single piston vs. 3-actuator)
+2. Convert/rebuild robot model for Isaac Sim (USD format)
+3. Implement tactile force plate sensing in simulation
+4. Port or rewrite swarm coordination and piston height control for Isaac Sim
+5. Define swarm communication protocol between units
+
+---
+
+## Session 1 (continued) — NeuroWare (2026-06-15)
+
+### Study session — Swarm robotics + communication architecture
+- Read Yadav et al. paper in full; read Wen et al. "Swarm Robotics Control and Communications" (IEEE Comms Magazine, 2018)
+- Key decision: AI direction is decentralised swarm robotics with blockchain-like peer-to-peer communication architecture — no central controller for carrying/balancing; consensus reached between robots using only local sensing and inter-robot communication
+- Communication identified as the foundational layer — shapes all other AI/control decisions
+
+### Architecture design — agents, captains, and communication
+**Terminology:**
+- Individual robots = **agents**
+- Coordination/memory nodes = **captains** (not necessarily robots, infrastructure nodes)
+
+**Communication layers:**
+- Agent ↔ agent — ESP-NOW, local peer-to-peer, close proximity, fast and low latency
+- Agent → captain — ESP32 mesh, messages relay through other agents to reach captain
+- Captain ↔ captain — blockchain-like consensus for shared memory sync
+- Captain → agents — non-blocking broadcast ping, agents self-select to respond based on availability
+
+**Captain responsibilities:**
+- Memory bank only — aggregates what agents report, does not assign or control agents
+- Represents a zone by knowing what agents have reported within it
+- Syncs with other captains to keep distributed memory consistent
+- Does not micromanage agents — agents are autonomous at all times
+
+**Task flow:**
+- External task arrives, captain broadcasts a lightweight ping
+- Free agents self-select to respond — busy agents ignore the ping
+- If no agents respond, captain escalates to neighbouring captains via blockchain layer
+- Neighbouring agents can reach original captain via mesh or work under their own captain
+- Task ownership follows object location — captain whose zone the object is in owns the task record
+- Agents report back to nearest captain after placing an object; captain records it
+
+**Prototype scale:**
+- Simulation: 12-15 agents, 2-3 captains
+- Physical build: 5-6 agents
+- Hardware: ESP32 viable at both scales
+
+**Parked for later:**
+- Agent priority definitions (how agents choose between competing pings)
+- Dynamic captain role assignment (agent temporarily becoming captain for a task)
+- Lightweight ping optimisation
+- Rigid zone boundary definitions
+
+---
+
+## Session 2 — NeuroWare (2026-06-16)
+
+### What was done
+- Implemented gossip protocol in `simulation/agent.py` — replaces old `consider_captains` / `learn_from_neighbours` polling model
+- Removed all captain-driven agent assignment; agents now fully self-select from their own `known_tasks` store
+- Gossip runs unconditionally every frame (even when agent is busy or carrying), only task execution is gated on free state
+- Four new methods: `absorb_captain_info`, `gossip`, `cleanup_known_tasks`, `evaluate_known_tasks`
+- `update()` restructured: gossip block first, then busy/idle gate, then evaluate
+
+### What worked
+- Smoke tests pass cleanly — all gossip methods run without error, import chain intact
+- Architecture is correct: an agent mid-carry or busy will still propagate task info to any agent it encounters
+
+### What did not work
+- Goal delivery broken — agents are not acting on goal-type entries in `known_tasks` correctly (exact cause not diagnosed)
+
+### Current state
+Gossip protocol implemented and structurally sound. Core pickup + store + co-carry flow should be unaffected. Goal delivery is the immediate known bug.
+
+### Next steps (high level)
+1. Debug goal delivery — trace why `evaluate_known_tasks` is not triggering `_commit_to_goal` correctly
+2. Test gossip propagation end-to-end with a multi-agent scenario (item placed, captain pings, agents far from captain still learn via neighbours)
+3. Tune `COMM_RANGE` back down from 250 once gossip is confirmed working
+
+---
+
+## Session 3 — NeuroWare (2026-06-16)
+
+### What was done
+- Fixed goal delivery — three root causes in gossip/cleanup/commit logic (detail in agent log)
+- Added heavy item goal delivery: 2-agent co-carry from storage to goal zone, new `co_delivering` state chain
+- Fixed crash on G+4/5/6: infinite recursion in `receive_goal_request` between captains (detail in captain log)
+- Added task prioritisation: agents prefer filling an in-progress heavy item's co-carrier slot over starting a new solo task
+
+### What worked
+- All goal delivery paths now functional: light (1 agent) and heavy (2 agents)
+- Priority ordering confirmed by unit test
+
+### What did not work
+- N/A
+
+### Current state
+Core simulation loop fully functional. Pickup, store, and goal delivery working for all item types. Swarm prioritises completing in-progress tasks before starting new ones.
+
+### Next steps (high level)
+1. Tune `COMM_RANGE` back from 250 and verify gossip still propagates reliably
+2. Cooperative task allocation for high-agent-count tasks (parked — detail in agent log)
+3. Scale agent count toward 12-15 and observe emergent behaviour
+
+---
+
+## Session 4 — NeuroWare (2026-06-16)
+
+### What was done
+- **Complete simulation redesign: carry model → push model.** Items now have physical presence and collision; agents push them by positioning on the opposite side and applying force.
+- Rewrote `item.py`: physics accumulator (`_push_fx/fy`), `physics_update()`, `resolve_collision()`, `claimed_slots` per side, `slot_position()`, `needed_sides()`, `apply_push()`, `is_available()`
+- Rewrote `agent.py`: new state machine `seek_push_slot → waiting_for_co_pusher → pushing`, gossip now shares item object directly by reference via `known_tasks = {item_id: item}`, per-side push logic, break-off on axis completion
+- Updated `captain.py`: adapted for push model (`claimed_slots` replaces `carriers`), added `phase` tracking (`to_store`/`to_goal`), race guards preventing re-claim of in-flight items
+- Updated `main.py`: new update order (sense → agent.update → item.physics_update → item-item collision → captains), keys 1/2/3 only, `draw_push_links` replaces `draw_co_carry_link`
+- Rewrote `config.py`: 3 item types (S/M/L with `agents_per_side` 1/2/3), push physics constants, removed old carry-model constants
+- Multiple bugs found and fixed across the session (detail in component logs)
+- End-of-session fixes: `_side_ready` physical proximity check, `_do_waiting_for_co_pusher` displacement re-seek, `_do_seek_push_slot` perpendicular-side-based speed logic
+
+### What worked
+- Push model core: agents claim slots, navigate to slot position, wait for co-pushers, apply force — item moves
+- Per-side independence: one axis can start pushing while the other is still filling agents
+- Break-off logic: agents on a completed axis detect they're no longer needed and release
+- Diagonal rule enforced structurally: single agent cannot push at 45° — can only push the axis their side corresponds to
+- Finalization race guard: `item.destination = None` set immediately on first finalize call, prevents double-finalization
+
+### What did not work
+- Item pushed off map early on (force applied before arrival check; physics_update ran on stored items; no boundary clamp) — all fixed
+- Vertical pusher not breaking off after item reached 0° angle — fixed with `elif side not in item.needed_sides()` in `_do_pushing`
+- Item started moving before all agents in position — fixed with per-side `_transition_side_to_pushing` and `waiting_for_co_pusher` state
+- Goals reverted to store phase — captain's `_scan_for_items` re-claimed `to_goal` items — fixed with `if item.phase == "to_goal": continue`
+- `_apply_separation` AttributeError — leftover call after method deleted — fixed
+- A1 pushed L-type item on vertical axis alone: `_side_ready` checked task state only, not physical position — A4/A5 were displaced by moving item but still flagged as `waiting_for_co_pusher` — **this is the final bug addressed at end of session**
+
+### Current state
+Push model fully redesigned and operational. The three end-of-session fixes (`_side_ready` proximity check, displacement re-seek, speed logic) were applied but not yet play-tested. Ready for testing session.
+
+### Next steps (high level)
+1. Play-test the three end-of-session fixes — confirm L-type no longer pushes on one axis alone
+2. Tune push speed multipliers (2.0/1.0/0.7) against observed agent behaviour
+3. Tune `PUSH_FORCE`, `ITEM_DAMPING`, `PUSH_SPEED_MAX` for physical feel
+4. Add item log (item.py was completely rewritten and has no component log yet)
