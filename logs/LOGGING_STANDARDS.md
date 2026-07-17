@@ -17,7 +17,7 @@ The primary reader of every log entry is **an AI assistant at the start of a fut
 | `logs/DEVLOG.md` | One entry per session. High-level only. What changed, what broke, current state, next steps. |
 | `logs/agent.md` | Detailed history of `agent.py` across sessions. |
 | `logs/captain.md` | Detailed history of `captain.py` across sessions. |
-| `logs/environment.md` | Detailed history of `config.py`, `item.py`, `zone.py`, `main.py` — the simulation environment. |
+| `logs/environment.md` | Detailed history of `config.py`, `grid.py`, `main.py` — the simulation environment. (`item.py`/`zone.py` were deleted in Session 5; their history remains in this file's earlier entries.) |
 
 Additional component logs may be created when a component grows complex enough to warrant one. Ask the user before creating a new log file.
 

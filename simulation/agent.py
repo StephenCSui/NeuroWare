@@ -1,475 +1,288 @@
 import math
 import random
 import pygame
-from config import (AGENT_SIZE, AGENT_SPEED, COMM_RANGE, VISION_RANGE, COLORS,
-                    BUSY_CHANCE, BUSY_DURATION, PUSH_FORCE,
-                    BREAKOFF_WAIT, DEST_THRESHOLD,
-                    WINDOW_WIDTH, WINDOW_HEIGHT)
+from config import (AGENT_SIZE, AGENT_SPEED, BUSY_CHANCE, BUSY_DURATION,
+                    COLORS, TASK_DURATIONS, WATER_REFILL_AMOUNT, STUCK_REROUTE_FRAMES,
+                    HARVEST_REWARD, WATER_REWARD, WEED_REWARD)
 
 
 class Agent:
-    def __init__(self, agent_id, x, y):
-        self.agent_id    = agent_id
-        self.x           = float(x)
-        self.y           = float(y)
-        self.neighbours  = []
-        self.seen_items  = []
+    def __init__(self, agent_id, spawn_cell, policy=None):
+        self.agent_id = agent_id
+        self.policy   = policy   # None -> flat random.choice baseline; else a TaskPolicy
+        x, y = spawn_cell.center()
+        self.x, self.y = float(x), float(y)
 
-        # Push slot — {"item": Item, "side": str, "idx": int} or None
-        self.push_slot   = None
-        self.going_for   = None   # item_id currently committed to
+        # Grid-stepped movement — occupancy is hard-exclusive, every cell type
+        self.current_cell    = spawn_cell
+        self._moving_to_cell = None   # reserved destination cell, mid-step
+        self._target_cell    = None   # ultimate goal: a claimed task cell, or a wander destination
+        self._path           = None   # cached BFS route (remaining cells) toward _path_target
+        self._path_target    = None   # which target _path was computed for
+        self._stuck_frames   = 0      # consecutive frames blocked on the same cached step
+        spawn_cell.occupy(agent_id)
 
         # Task state
-        self._task       = None
-        self._wait_timer = 0.0   # time spent in waiting_for_co_pusher
+        self._task       = None   # None | "moving_to_task" | "performing_task"
+        self._task_type  = None   # "monitor" | "weed" | "water" | "obtain_water"
+        self._task_timer = 0.0
+
+        # Water resource — consumed by one "water" task, must be refilled at a
+        # water cell before the agent can water again. Starts full.
+        self.water = True
+
+        # Harvest carrying capacity — one at a time, mirrors the water flag:
+        # while True, delivering to the harvest box is the only action considered.
+        self.carrying_harvest = False
 
         # Busy state
-        self.busy        = False
-        self.busy_timer  = 0.0
+        self.busy       = False
+        self.busy_timer = 0.0
 
-        # Gossip store — item_id → Item (destination/phase live on item object)
-        self.known_tasks = {}
-
-        # Wander target
-        self._target_x   = float(x)
-        self._target_y   = float(y)
-        self._pick_random_target()
+        # RL bookkeeping — set by TaskPolicy.select()/Agent._complete_task,
+        # read by train.py. Meaningless (and unused) on the random-choice path.
+        self.last_state  = None
+        self.last_action = None
+        self.last_reward = None
 
     # ------------------------------------------------------------------
-    # Movement
+    # Movement — grid-stepped, occupancy-reserved
     # ------------------------------------------------------------------
 
-    def _pick_random_target(self):
-        margin = 40
-        self._target_x = random.uniform(margin, WINDOW_WIDTH  - margin)
-        self._target_y = random.uniform(margin, WINDOW_HEIGHT - margin)
-
-    def _move_toward(self, tx, ty, speed=None, arrive_dist=2):
-        spd  = speed or AGENT_SPEED
-        dx   = tx - self.x
-        dy   = ty - self.y
+    def _move_toward(self, tx, ty, speed):
+        dx, dy = tx - self.x, ty - self.y
         dist = math.hypot(dx, dy)
-        if dist < arrive_dist:
+        if dist < 1.5:
+            self.x, self.y = tx, ty
             return True
-        self.x += (dx / dist) * spd
-        self.y += (dy / dist) * spd
+        self.x += (dx / dist) * speed
+        self.y += (dy / dist) * speed
         return False
 
-    # ------------------------------------------------------------------
-    # Sensing
-    # ------------------------------------------------------------------
+    def step_toward(self, grid, target_cell):
+        """Advance one grid-step toward target_cell, following a cached BFS
+        route (recomputed only when the target changes or the route runs out —
+        not every frame). Reserves the next cell the moment it commits to it
+        (not on arrival), so two agents can't both start converging on the same
+        empty cell mid-step. A temporarily-occupied next cell just waits and
+        retries — the cached route only needs recomputing around permanent
+        (blocked) obstacles, not other agents passing through. Returns True
+        once arrived."""
+        if self.current_cell is target_cell:
+            self._path = None
+            self._stuck_frames = 0
+            return True
 
-    def sense_neighbours(self, all_agents):
-        self.neighbours = [
-            a for a in all_agents
-            if a.agent_id != self.agent_id
-            and math.hypot(a.x - self.x, a.y - self.y) <= COMM_RANGE
-        ]
+        if self._moving_to_cell is None:
+            if self._path is None or self._path_target is not target_cell:
+                self._path         = grid.shortest_path(self.current_cell, target_cell)[1:]
+                self._path_target  = target_cell
+                self._stuck_frames = 0
 
-    def sense_items(self, all_items):
-        self.seen_items = [
-            item for item in all_items
-            if not item.delivered
-            and math.hypot(item.x - self.x, item.y - self.y) <= VISION_RANGE
-        ]
+            if not self._path:
+                return False   # no route exists — wait (shouldn't happen on a connected layout)
 
-    # ------------------------------------------------------------------
-    # Gossip
-    # ------------------------------------------------------------------
-
-    def absorb_captain_info(self, captains):
-        for cap in captains:
-            if math.hypot(self.x - cap.x, self.y - cap.y) > COMM_RANGE:
-                continue
-            for item_id, item in cap.active_pings.items():
-                if item_id not in self.known_tasks:
-                    self.known_tasks[item_id] = item
-            for item_id, (item, _) in cap.goal_pings.items():
-                # destination/phase already set on item by captain
-                self.known_tasks[item_id] = item
-
-    def gossip(self):
-        for nb in self.neighbours:
-            for item_id, item in self.known_tasks.items():
-                if item_id not in nb.known_tasks:
-                    nb.known_tasks[item_id] = item
-
-    def cleanup_known_tasks(self):
-        for item_id in list(self.known_tasks.keys()):
-            item = self.known_tasks[item_id]
-            if item.delivered:
-                del self.known_tasks[item_id]
-            elif item.stored and item.phase == "to_store":
-                # Storage leg complete — waiting for goal request; drop it
-                del self.known_tasks[item_id]
-            elif not item.is_available():
-                # All slots filled — only keep if we hold one
-                if self.push_slot is None or self.push_slot.get("item") is not item:
-                    del self.known_tasks[item_id]
-
-    # ------------------------------------------------------------------
-    # Task evaluation
-    # ------------------------------------------------------------------
-
-    def evaluate_known_tasks(self):
-        if self._task is not None:
-            return
-
-        in_progress = []
-        fresh       = []
-
-        for item_id, item in self.known_tasks.items():
-            if not item.is_available():
-                continue
-            needed   = item.needed_sides()
-            any_open = any(len(item.claimed_slots[s]) < item.agents_per_side for s in needed)
-            if not any_open:
-                continue
-            has_claimed = any(len(item.claimed_slots[s]) > 0 for s in needed)
-            if has_claimed:
-                in_progress.append(item)
+            next_cell = self._path[0]
+            if next_cell.is_occupiable():
+                next_cell.occupy(self.agent_id)
+                self._moving_to_cell = next_cell
+                self._path.pop(0)
+                self._stuck_frames = 0
             else:
-                fresh.append(item)
+                self._stuck_frames += 1
+                if self._stuck_frames > STUCK_REROUTE_FRAMES:
+                    # Stuck on this exact cell too long (likely another agent
+                    # waiting right back at us) — reroute around current traffic.
+                    rerouted = grid.shortest_path(self.current_cell, target_cell, avoid_occupied=True)[1:]
+                    if rerouted:
+                        self._path = rerouted
+                    self._stuck_frames = 0
+                return False   # temporarily blocked by another agent — wait this frame, retry next
 
-        # Pass 1 — fill partial teams first; within an item prefer the side closest to full
-        for item in in_progress:
-            needed = item.needed_sides()
-            # Sort sides by how many are already claimed descending (closest to full first)
-            sorted_sides = sorted(needed,
-                                  key=lambda s: len(item.claimed_slots[s]),
-                                  reverse=True)
-            for side in sorted_sides:
-                if len(item.claimed_slots[side]) < item.agents_per_side:
-                    if self._try_claim_slot(item, side):
-                        return
+        tx, ty = self._moving_to_cell.center()
+        if self._move_toward(tx, ty, AGENT_SPEED):
+            self.current_cell.vacate()
+            self.current_cell = self._moving_to_cell
+            self._moving_to_cell = None
 
-        # Pass 2 — take on fresh items
-        for item in fresh:
-            for side in item.needed_sides():
-                if len(item.claimed_slots[side]) < item.agents_per_side:
-                    if self._try_claim_slot(item, side):
-                        return
+        return self.current_cell is target_cell
 
-    def _try_claim_slot(self, item, side):
-        if item.claim_slot(self, side):
-            idx             = item.claimed_slots[side].index(self)
-            self.push_slot  = {"item": item, "side": side, "idx": idx}
-            self._task      = "seek_push_slot"
-            self.going_for  = item.item_id
-            return True
-        return False
+    def _pick_random_target(self, grid):
+        # Deadspace is a hard barrier now — never wander toward a cell that can't be entered
+        self._target_cell = random.choice([c for c in grid.all_cells() if not c.blocked])
 
-    def reconsider_task(self):
-        """Break off from waiting if a better use exists."""
-        if self._task != "waiting_for_co_pusher":
-            return
-        if self._wait_timer < BREAKOFF_WAIT:
-            return
+    # ------------------------------------------------------------------
+    # Task evaluation — either a TaskPolicy (rl_policy.py, trained via
+    # train.py) or, when self.policy is None, the original flat/unweighted
+    # baseline: pick uniformly at random among currently-known needy cells.
+    # ------------------------------------------------------------------
 
-        current_item = self.push_slot["item"]
+    def evaluate_and_claim(self, grid):
+        tick = grid.tick_count
 
-        # Look for another item with urgently needed slots (partial team waiting)
-        for item in self.known_tasks.values():
-            if item is current_item or not item.is_available():
-                continue
-            needed = item.needed_sides()
-            partial = any(0 < len(item.claimed_slots[s]) < item.agents_per_side
-                          for s in needed)
-            if partial:
-                self._release_and_reset()
+        if self.policy is not None:
+            result = self.policy.select(self, grid)
+            if result is None:
+                return
+            cell, task_type = result
+        else:
+            candidates = [
+                cell for cell in grid.plant_cells()
+                if cell.is_claimable(tick) and (
+                    cell.needs_monitoring(tick) or cell.needs_water() or
+                    cell.needs_weeding() or cell.needs_harvest()
+                )
+            ]
+            if not candidates:
                 return
 
-        # After double the threshold, consider any item with open slots
-        if self._wait_timer > BREAKOFF_WAIT * 2:
-            for item in self.known_tasks.values():
-                if item is current_item or not item.is_available():
-                    continue
-                if any(len(item.claimed_slots[s]) < item.agents_per_side
-                       for s in item.needed_sides()):
-                    self._release_and_reset()
-                    return
+            cell = random.choice(candidates)
+            applicable = []
+            if cell.needs_monitoring(tick):
+                applicable.append("monitor")
+            if cell.needs_water():
+                applicable.append("water")
+            if cell.needs_weeding():
+                applicable.append("weed")
+            if cell.needs_harvest():
+                applicable.append("harvest")
+            task_type = random.choice(applicable)
+
+        # Race guard — relies on strictly-sequential per-frame agent processing
+        # in main.py; breaks if the update loop is ever parallelized.
+        if not cell.is_claimable(tick):
+            return
+
+        cell.claim(self.agent_id, task_type, tick)
+        self._target_cell = cell
+        self._task_type   = task_type
+        self._task        = "moving_to_task"
+        self._task_timer  = 0.0
+
+    def _begin_refill(self, grid):
+        """Out of water — head to a water cell. Picked at random, not nearest,
+        so all water cells actually get used instead of everyone piling onto
+        whichever one happens to be closest to the bridge exit. Not a
+        plant-cell claim (nothing to release when done), just a personal
+        resource trip."""
+        self._target_cell = random.choice(grid.water_cells())
+        self._task_type   = "obtain_water"
+        self._task        = "moving_to_task"
+        self._task_timer  = 0.0
+
+    def _begin_deliver(self, grid):
+        """Carrying a harvest — head straight to the harvest box to drop it
+        off. Not a plant-cell claim, just a personal delivery trip, same
+        shape as _begin_refill."""
+        self._target_cell = grid.harvest_box_cell()
+        self._task_type   = "deliver_harvest"
+        self._task        = "moving_to_task"
+        self._task_timer  = 0.0
 
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
 
-    def update(self, dt, zones, captains, items):
-        self.absorb_captain_info(captains)
-        self.gossip()
-        self.cleanup_known_tasks()
-
+    def update(self, dt, grid):
         if self.busy:
             self.busy_timer -= dt
             if self.busy_timer <= 0:
-                self.busy      = False
-                self._task     = None
-                self.going_for = None
-                self._pick_random_target()
+                self.busy = False
+                self._pick_random_target(grid)
             return
 
-        if self._task is None and random.random() < BUSY_CHANCE:
-            self.busy       = True
-            self.busy_timer = BUSY_DURATION + random.uniform(-1, 1)
-            return
+        if self._task is None:
+            if self.carrying_harvest:
+                # Both hands full — nothing else to consider until it's delivered.
+                self._begin_deliver(grid)
+            elif not self.water:
+                # Out of water takes priority over any other task — must refill first.
+                self._begin_refill(grid)
+            elif random.random() < BUSY_CHANCE:
+                self.busy       = True
+                self.busy_timer = BUSY_DURATION + random.uniform(-1, 1)
+                return
+            else:
+                self.evaluate_and_claim(grid)
 
-        self.reconsider_task()
-        self.evaluate_known_tasks()
-
-        if self._task == "seek_push_slot":
-            self._do_seek_push_slot(dt)
-        elif self._task == "waiting_for_co_pusher":
-            self._do_waiting_for_co_pusher(dt)
-        elif self._task == "pushing":
-            self._do_pushing(dt, zones, captains)
-        elif self._task is None:
-            arrived = self._move_toward(self._target_x, self._target_y)
-            if arrived:
-                self._pick_random_target()
-
-        self._resolve_item_collisions(items)
-
-        self.x = max(10, min(WINDOW_WIDTH  - 10, self.x))
-        self.y = max(10, min(WINDOW_HEIGHT - 10, self.y))
+        if self._task == "moving_to_task":
+            self._do_moving_to_task(dt, grid)
+        elif self._task == "performing_task":
+            self._do_performing_task(dt, grid)
+        else:
+            if self._target_cell is None:
+                self._pick_random_target(grid)
+            elif self.step_toward(grid, self._target_cell):
+                self._target_cell = None
 
     # ------------------------------------------------------------------
     # Task handlers
     # ------------------------------------------------------------------
 
-    def _do_seek_push_slot(self, dt):
-        if self.push_slot is None:
-            self._reset()
-            return
-        item = self.push_slot["item"]
-        side = self.push_slot["side"]
-
-        if item.delivered or (item.stored and item.phase == "to_store"):
+    def _do_moving_to_task(self, dt, grid):
+        cell = self._target_cell
+        # obtain_water/deliver_harvest aren't plant-cell claims — nothing to validate, just travel there
+        if self._task_type not in ("obtain_water", "deliver_harvest") and cell.claimed_by != self.agent_id:
+            # Claim was stolen after timing out while we were still travelling
             self._release_and_reset()
             return
+        if self.step_toward(grid, cell):
+            self._task       = "performing_task"
+            self._task_timer = 0.0
 
-        # Recompute idx in case list changed
-        try:
-            idx = item.claimed_slots[side].index(self)
-        except ValueError:
-            self._release_and_reset()
-            return
+    def _do_performing_task(self, dt, grid):
+        self._task_timer += dt
+        if self._task_timer >= TASK_DURATIONS[self._task_type]:
+            self._complete_task(grid)
 
-        self.push_slot["idx"] = idx
-        tx, ty = item.slot_position(side, idx)
+    def _complete_task(self, grid):
+        cell = self._target_cell
+        tick = grid.tick_count
+        self.last_reward = 0.0   # overwritten below for water/weed/deliver_harvest — RL bookkeeping, harmless otherwise
 
-        # Speed is determined by what agents can observe about the perpendicular side
-        perp_sides = [s for s in item.needed_sides() if s != side]
-        perp_has_agent = any(len(item.claimed_slots[s]) > 0 for s in perp_sides)
-        perp_seeking_nearby = any(
-            nb.push_slot is not None
-            and nb.push_slot.get("item") is item
-            and nb.push_slot.get("side") in perp_sides
-            and nb._task == "seek_push_slot"
-            for nb in self.neighbours
-        )
-
-        if not perp_has_agent:
-            # Nobody going for diagonal — sprint, solo axis is the only option
-            speed = AGENT_SPEED * 2.0
-        elif perp_seeking_nearby:
-            # A diagonal agent is nearby and getting into position — yield, let them anchor
-            speed = AGENT_SPEED * 0.7
+        if self._task_type == "obtain_water":
+            self.water = True   # refilled — nothing was claimed, nothing to release
+        elif self._task_type == "deliver_harvest":
+            self.carrying_harvest = False   # dropped off — nothing was claimed, nothing to release
+            grid.score += HARVEST_REWARD
+            self.last_reward = HARVEST_REWARD
         else:
-            # Diagonal agents are claimed but not close yet — normal pace
-            speed = AGENT_SPEED
+            if self._task_type == "water":
+                cell.moisture = min(100.0, cell.moisture + WATER_REFILL_AMOUNT)
+                self.water = False   # consumed — must refill before watering again
+                grid.score += WATER_REWARD
+                self.last_reward = WATER_REWARD
+            elif self._task_type == "weed":
+                cell.weed_density = 0.0
+                grid.score += WEED_REWARD
+                self.last_reward = WEED_REWARD
+            elif self._task_type == "harvest":
+                cell.status = "harvested"
+                self.carrying_harvest = True
+            # monitor: no true-state change
 
-        arrived = self._move_toward(tx, ty, speed)
+            if self._task_type != "harvest":
+                cell.observe(tick)   # water/weed also count as an observation — agent is right there
+            cell.release()
 
-        if arrived:
-            self._task       = "waiting_for_co_pusher"
-            self._wait_timer = 0.0
-            if self._side_ready(item, side):
-                self._transition_side_to_pushing(item, side)
-
-    def _side_ready(self, item, side):
-        """True when this side's slots are all claimed, all holders are in task state,
-        and all OTHER holders are physically ≤2px from their slot position."""
-        slots = item.claimed_slots[side]
-        if len(slots) < item.agents_per_side:
-            return False
-        for i, a in enumerate(slots):
-            if a is self:
-                continue
-            if a._task not in ("waiting_for_co_pusher", "pushing"):
-                return False
-            tx, ty = item.slot_position(side, i)
-            if math.hypot(a.x - tx, a.y - ty) > 2:
-                return False
-        return True
-
-    def _do_waiting_for_co_pusher(self, dt):
-        if self.push_slot is None:
-            self._reset()
-            return
-        item = self.push_slot["item"]
-        side = self.push_slot["side"]
-        self._wait_timer += dt
-
-        if item.delivered or (item.stored and item.phase == "to_store"):
-            self._release_and_reset()
-            return
-
-        # Track slot position — item may already be moving on the other axis
-        try:
-            idx = item.claimed_slots[side].index(self)
-        except ValueError:
-            self._release_and_reset()
-            return
-        self.push_slot["idx"] = idx
-        tx, ty = item.slot_position(side, idx)
-        dist_to_slot = math.hypot(self.x - tx, self.y - ty)
-
-        # If displaced too far from slot (item moved us), go back into seek
-        if dist_to_slot > 2:
-            self._task = "seek_push_slot"
-            return
-
-        if self._side_ready(item, side):
-            self._transition_side_to_pushing(item, side)
-
-    def _transition_side_to_pushing(self, item, side):
-        """Start pushing for this side only. Other sides may still be filling."""
-        if item.phase == "to_goal" and item.stored:
-            item.stored = False
-        self._task       = "pushing"
-        self._wait_timer = 0.0
-        for agent in item.claimed_slots[side]:
-            if agent is not self and agent._task == "waiting_for_co_pusher":
-                agent._task       = "pushing"
-                agent._wait_timer = 0.0
-
-    def _should_push(self, item, side):
-        """Per-axis overshoot guard — stop pushing if item has passed destination on this axis."""
-        if item.destination is None:
-            return False
-        dx = item.destination[0] - item.x
-        dy = item.destination[1] - item.y
-        if side == "LEFT":   return dx >  5    # need rightward motion
-        if side == "RIGHT":  return dx < -5    # need leftward motion
-        if side == "TOP":    return dy >  5    # need downward motion
-        if side == "BOTTOM": return dy < -5    # need upward motion
-        return False
-
-    def _do_pushing(self, dt, zones, captains):
-        if self.push_slot is None:
-            self._reset()
-            return
-        item = self.push_slot["item"]
-        side = self.push_slot["side"]
-
-        # Another agent already finalized this item
-        if item.delivered or (item.stored and item.phase == "to_store"):
-            self._release_and_reset()
-            return
-
-        # Check arrival BEFORE applying any force this frame
-        if item.destination is not None:
-            dist = math.hypot(item.x - item.destination[0],
-                              item.y - item.destination[1])
-            if dist < DEST_THRESHOLD:
-                self._finalize_delivery(item, zones, captains)
-                return
-
-        # Only push if item still needs to move in our direction (overshoot guard)
-        if self._should_push(item, side):
-            item.apply_push(side, PUSH_FORCE)
-        elif side not in item.needed_sides():
-            # This axis is genuinely no longer needed — break off and free up
-            self._release_and_reset()
-            return
-
-        # Follow item — stay on slot position as it moves
-        try:
-            idx = item.claimed_slots[side].index(self)
-        except ValueError:
-            self._release_and_reset()
-            return
-        self.push_slot["idx"] = idx
-        tx, ty = item.slot_position(side, idx)
-        self._move_toward(tx, ty, AGENT_SPEED * 1.4)
-
-    def _finalize_delivery(self, item, zones, captains):
-        """Called by the first pusher to detect arrival. Resets all slot holders."""
-        # Guard: another agent may have already finalized this frame
-        if item.destination is None or item.delivered or (item.stored and item.phase == "to_store"):
-            self._release_and_reset()
-            return
-
-        # Zero accumulator immediately so physics_update can't move item this frame
-        item._push_fx = 0.0
-        item._push_fy = 0.0
-        item.vx       = 0.0
-        item.vy       = 0.0
-        item.destination = None   # acts as a lock against double-finalization
-
-        if item.phase == "to_store":
-            item.stored = True
-            sx, sy = zones["storing"].center()
-            item.x = sx + random.uniform(-40, 40)
-            item.y = sy + random.uniform(-30, 30)
-            for cap in captains:
-                cap.sync_memory(item)
-        else:  # to_goal
-            item.delivered = True
-            item.stored    = False
-
-        # Release all slot holders
-        for side_list in item.claimed_slots.values():
-            for agent in list(side_list):
-                if agent is not self:
-                    agent.push_slot  = None
-                    agent._task      = None
-                    agent.going_for  = None
-                    agent._wait_timer = 0.0
-                    agent._pick_random_target()
-        item.claimed_slots = {"LEFT": [], "RIGHT": [], "TOP": [], "BOTTOM": []}
-
-        self.push_slot   = None
-        self._task       = None
-        self.going_for   = None
-        self._wait_timer = 0.0
-        self._pick_random_target()
+        self._task        = None
+        self._task_type   = None
+        self._target_cell = None
+        self._task_timer  = 0.0
 
     def _release_and_reset(self):
-        if self.push_slot:
-            self.push_slot["item"].release_slot(self)
-            self.push_slot = None
-        self._task       = None
-        self.going_for   = None
-        self._wait_timer = 0.0
-        self._pick_random_target()
-
-    def _reset(self):
-        self._task      = None
-        self.going_for  = None
-        self._pick_random_target()
-
-    # ------------------------------------------------------------------
-    # Collision
-    # ------------------------------------------------------------------
-
-    def _resolve_item_collisions(self, items):
-        """Hard separation from items we are not pushing."""
-        half = AGENT_SIZE // 2
-        for item in items:
-            if item.stored or item.delivered:
-                continue
-            if self.push_slot and self.push_slot["item"] is item:
-                continue  # in contact intentionally
-            rect = item.collision_rect
-            ax1, ay1 = self.x - half, self.y - half
-            ax2, ay2 = self.x + half, self.y + half
-            if ax2 > rect.left and ax1 < rect.right and ay2 > rect.top and ay1 < rect.bottom:
-                ox = min(ax2 - rect.left, rect.right - ax1)
-                oy = min(ay2 - rect.top, rect.bottom - ay1)
-                if ox < oy:
-                    self.x += ox if self.x > rect.centerx else -ox
-                else:
-                    self.y += oy if self.y > rect.centery else -oy
+        if self._target_cell is not None and self._target_cell.claimed_by == self.agent_id:
+            self._target_cell.release()
+        if self._moving_to_cell is not None:
+            self._moving_to_cell.vacate()
+            self._moving_to_cell = None
+        self._task        = None
+        self._task_type   = None
+        self._target_cell = None
+        self._task_timer  = 0.0
+        self._path          = None
+        self._path_target   = None
+        self._stuck_frames  = 0
 
     # ------------------------------------------------------------------
     # Draw
@@ -481,9 +294,9 @@ class Agent:
 
         if self.busy:
             color = COLORS["agent_busy"]
-        elif self._task == "pushing":
+        elif self._task == "performing_task":
             color = COLORS["agent_push"]
-        elif self._task in ("waiting_for_co_pusher",):
+        elif self._task == "moving_to_task":
             color = COLORS["agent_waiting"]
         else:
             color = COLORS["agent"]
@@ -501,34 +314,14 @@ class Agent:
         if self.busy:
             s = font.render("BUSY", True, (200, 80, 80))
             surface.blit(s, (cx - s.get_width() // 2, cy + half + 2))
-        elif self._task:
-            task_label = {
-                "seek_push_slot":      "seek",
-                "waiting_for_co_pusher": "wait",
-                "pushing":             "push",
-            }.get(self._task, self._task)
-            s = font.render(task_label, True, COLORS["text_dim"])
+        elif self._task_type:
+            s = font.render(self._task_type, True, COLORS["text_dim"])
             surface.blit(s, (cx - s.get_width() // 2, cy + half + 2))
 
-    def draw_comm_links(self, surface):
-        for nb in self.neighbours:
-            if nb.agent_id > self.agent_id:
-                pygame.draw.line(surface, COLORS["comm_link"],
-                                 (int(self.x), int(self.y)),
-                                 (int(nb.x),   int(nb.y)), 1)
-
-    def draw_push_links(self, surface):
-        """Draw lines between agents pushing the same item."""
-        if self.push_slot is None:
+    def draw_task_link(self, surface):
+        if self._target_cell is None or self._task is None:
             return
-        item = self.push_slot["item"]
-        for side_list in item.claimed_slots.values():
-            for agent in side_list:
-                if agent is not self and agent.agent_id > self.agent_id:
-                    pygame.draw.line(surface, COLORS["push_link"],
-                                     (int(self.x), int(self.y)),
-                                     (int(agent.x), int(agent.y)), 2)
-        # Also draw line from agent to item center
-        pygame.draw.line(surface, (*COLORS["push_link"], 120),
+        cx, cy = self._target_cell.center()
+        pygame.draw.line(surface, COLORS["task_link"],
                          (int(self.x), int(self.y)),
-                         (int(item.x), int(item.y)), 1)
+                         (int(cx), int(cy)), 2)

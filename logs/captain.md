@@ -115,3 +115,21 @@
 ### [WORTH EXPLORING]
 - Captain has no awareness of push progress — it cannot know if a "to_store" task is stalled (all agents dropped their slots, nobody re-claimed). A watchdog timer on `active_pings` items could detect stalled tasks and re-ping.
 - If `item.destination` is set by the captain but the item never gets claimed (no agents in range), the item sits with a destination but no movers indefinitely — no timeout or escalation exists.
+
+---
+
+## Session 5 — NeuroWare (2026-07-17)
+
+### Current state
+**Removed. `captain.py` deleted this session — no longer part of the codebase.**
+
+### What was done
+- Captains removed entirely as part of the warehouse-to-farm redesign, at explicit user direction: "remove captains completely, give agents full autonomy, as a swarm."
+- Root cause for removal, identified through discussion rather than a bug report: `Item.destination` — task *existence*, not just assignment — was only ever set by `Captain._scan_for_items`. Killing the captains would have left agents structurally unable to discover any new work even though they could already sense items directly (`sense_items`). This was a hidden single point of failure that defeated the actual point of swarm robotics (functioning without a central brain), not a design preference call.
+- Replacement: task existence is now derived directly from grid-cell state that agents sense themselves (see `agent.md`/environment entries this session) — no infrastructure/relay tier of any kind remains.
+
+### Key decisions
+- This is a closing entry, not a bug report. Captains functioned correctly for their scope in the warehouse model (Sessions 2–4 above) — they were removed because that scope itself (gating task existence behind a scan cycle) was the wrong shape for the autonomous-farm direction, not because of a defect in the implementation.
+
+### Dependencies
+N/A — file no longer exists.

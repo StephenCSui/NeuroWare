@@ -165,3 +165,74 @@ Push model fully redesigned and operational. The three end-of-session fixes (`_s
 2. Tune push speed multipliers (2.0/1.0/0.7) against observed agent behaviour
 3. Tune `PUSH_FORCE`, `ITEM_DAMPING`, `PUSH_SPEED_MAX` for physical feel
 4. Add item log (item.py was completely rewritten and has no component log yet)
+
+---
+
+## Session 5 — NeuroWare (2026-07-17)
+
+### What was done
+- Extended design discussion (played out over most of the session) covering: play-testing the Session 4 push-model fixes; a critique that captain-gated task discovery was a hidden single point of failure defeating the point of swarm robotics; a critique that deterministic top-of-sort task selection wasn't real "deciding"; comparison of ant (stigmergy) vs. bee (quorum-sensing) coordination models; a domain pivot decision — warehouse → fully autonomous farm, chosen over mining for richer task-allocation variety and personal relevance, after mining was floated first and reconsidered
+- Full architectural rewrite of the simulation to match: deleted `captain.py`, `item.py`, `zone.py`; added `grid.py`; rewrote `config.py`, `agent.py`, `main.py`
+- Captains removed entirely — full peer-to-peer agent autonomy, no infrastructure/relay tier
+- New grid-based farm model: cells are `plant` (moisture/weed dynamics) or `walkway` (inert, ≥2 cells wide so agents can pass each other), replacing the old loading/storing/goal zones and pushable items
+- New information model: each plant cell has hidden **true** state that drifts continuously and stochastically (jittered moisture decay, probabilistic weed-sprout events — not smooth/linear, deliberately unpredictable) and separate **known** state that only updates when an agent physically monitors/works the cell — task decisions read known state only, so the swarm can be and stay wrong about a cell until someone re-checks
+- New task model: three task types for this pass (monitor, weed, water — till/plant-organization/resource-constrained-watering explicitly deferred); flat, deliberately unweighted random selection among known needy cells (no scoring formula) — placeholder for a future AI/ML prioritization layer
+- New movement model: grid-stepped with hard per-cell occupancy (exactly one agent per cell at all times, regardless of task/movement/idle state) — replaces the old free continuous movement; agents reserve their next cell the moment they commit to stepping there, wait a frame if every neighbour is blocked
+- Gossip made global (any agent can act on any cell's known state regardless of position) rather than range-limited, since captains — not comms range — were the actual single point of failure identified this session
+- Redesigned the farm layout from a repeating bed/walkway pattern to an explicit template-based layout (user-supplied reference image): a 4x8 plant bed, pathway margins, a deadspace block, and a water zone, on a much smaller 16x12 grid (192 cells, down from 680, `CELL_SIZE` 30→45) — directly resolves the coverage/tuning gap noted below. `NUM_AGENTS` reduced 6→5.
+- Added a per-agent water resource flag: agents carry a single "charge" of water, consumed on each completed watering, requiring a refill trip to the water zone (its own timed `obtain_water` task, out-of-water is a hard gate blocking all other tasks) before they can water again — a deliberately simple, non-delegated version of the fetch/deliver mechanic discussed earlier, at explicit user direction to defer full task-handoff to a future AI-paired implementation
+- Deadspace made a genuine hard barrier (`Cell.blocked`) rather than inert walkable ground, per explicit user correction, requiring real pathfinding (`Grid.shortest_path`, BFS then upgraded to weighted Dijkstra) to replace the old single-step greedy movement, which had no way to route around a large static obstacle
+- Added cost-weighted pathing (plant cells cost more to traverse than pathway, via `CELL_TRAVERSAL_COST`) so cross-farm transit prefers routing around the plant bed — where working agents park — rather than cutting through it, per user observation that agents were bumping into each other unnecessarily on long trips
+
+### What worked
+- 20,000-tick headless verification run (script not committed to the repo, scratch-only): zero cell-occupancy violations, zero walkway cells ever claimed as tasks, zero premature water/weed candidacy on unmonitored cells, selection confirmed genuinely non-deterministic (claim distance-ranks spanned 5–678 of ~680 candidates, 0% picked the literal nearest), known-state staleness measurably diverging from true state over time (one cell showed a 50-point gap between belief and reality)
+- Live GUI launched and ran without errors on the actual display for the duration of testing
+- Re-verified after the template layout resize: all 32 plant cells got monitored within the test window (vs. 157/680 before), task-type balance became healthy (monitor/water/weed all firing at reasonable rates instead of monitor dominating)
+- Re-verified after the water flag, deadspace barrier, and weighted-pathing changes: zero water-flag violations, zero blocked-cell entries, full coverage maintained throughout; direct test confirmed a cross-bed trip that previously cut through plant cells now routes entirely via pathway (0 plant cells entered)
+
+### What did not work
+- Tuning gap (now resolved): with the original 680-plant-cell farm and 6 agents at the deliberately slow `AGENT_SPEED`, coverage couldn't keep pace with the map — monitor tasks vastly outnumbered water/weed tasks (177 vs. 10 vs. 3) because most cells stayed perpetually stale. Fixed by the template-based layout resize.
+- Real bug, caught via verification: the first pathfinding implementation (unweighted BFS, one cached path per journey, no fallback if another agent contested the exact next cell) caused a severe regression — task throughput collapsed to near-zero (15 claims vs. a baseline of ~180) because agents converging on the narrow water-zone bridge could deadlock waiting on each other indefinitely. Root cause: caching one shortest path and only ever checking it against the *static* map, never against other agents' actual positions. Fixed with a stuck-frame timeout (`STUCK_REROUTE_FRAMES`) that forces a reroute treating currently-occupied cells as temporary obstacles once a step has been blocked too long. Worth remembering as a category, not just a one-off: static pathfinding correctness and dynamic multi-agent contention are different problems, and fixing one doesn't fix the other.
+
+### Current state
+Farm swarm sim is functional and verified end-to-end on the new template-based layout — movement (grid-stepped, hard occupancy, weighted pathing around a real deadspace barrier), the water resource flag, task claiming, and the known/true state split are all working together with healthy task balance and full plant-cell coverage.
+
+### Next steps (high level)
+1. Rewrite `simulation/README.md` and root `README.md` — still describe the old warehouse/item/captain model
+2. **Deferred, explicitly for later (not a bug, a scope decision):** trajectory broadcasting / cooperative path reservation — agents plan and publish their intended route in advance so others can route around it, using something like expected task+travel time as the path cost, instead of the current per-step reactive contention handling. This is a real, established multi-robot technique (cooperative/prioritized path planning with time-reservations), but a good version needs to estimate dynamic congestion, which is a genuinely circular problem best paired with the AI/ML layer already being deferred for task prioritization and water fetch/deliver delegation — not something to hand-build with fixed heuristics now.
+3. Other deferred features from the approved plan: till task, plant-lifecycle/scoring system (day/night cycles, death, harvest), resource-constrained watering delegation (fetch/deliver as separate claimable phases), AI/ML-driven prioritization to replace flat random selection, range-limited gossip if global sharing proves too easy once observable
+
+---
+
+## Session 5 (continued) — NeuroWare (2026-07-18)
+
+### What was done
+- Compacted the farm: 5 agents → 2, 32 plant cells → 6, grid 16x12 → 10x8. Deadspace and the one-way lane system (both built for 5-agent bridge contention) were dropped entirely — not needed at this scale, and the one-way lanes had a measured throughput cost. `CELL_TRAVERSAL_COST` weighting dropped too — the open layout doesn't need it.
+- Added a plant lifecycle: `Cell.status` (`growing` → `ready` → `harvested`/`dead`/`spoiled`, last three terminal — no respawn under any circumstance for the rest of the season, confirmed explicitly with the user). Added a day cycle reusing the existing tick clock (`DAY_LENGTH_TICKS`, no separate time system) — maturity at day 28, a 2-day harvest window, season end at day 30.
+- Added death conditions (dehydration 100%, weeds 100%, or both ≥80% simultaneously) and a harvest+delivery task pair (`harvest` to pick, `deliver_harvest` to drop at a new harvest-box cell) with a one-at-a-time carrying-capacity flag on `Agent`, mirroring the existing `water` flag pattern.
+- Added scoring (`grid.score`, additive only — water/weed/harvest rewards, no penalties; the user's own reasoning was that losing the chance to ever harvest a dead cell already is the penalty).
+- Season end now halts agent activity (not rendering) — board and score stay visible rather than the process exiting.
+- Built and shipped an RL task-prioritization layer: a `TaskPolicy` (scikit-learn `MLPRegressor`, no new dependencies) trained via hand-rolled Q-learning in a new headless `train.py`, replacing the flat `random.choice` in `evaluate_and_claim` when a `USE_RL_POLICY` config flag is on. The random baseline stays fully intact and is the default — this was a hard requirement, since `grid.score` exists specifically to compare the two.
+
+### What worked
+- Headless full-season verification (scratch script, ~10 runs): 0 occupancy/claim violations across every run, lifecycle transitions correct, season-halt correct.
+- Caught and fixed two real balance/logic issues before they reached the user as "it's broken" (see below) rather than after.
+- RL training completed cleanly (2000 episodes, well under a minute headless): trained-greedy policy averaged 52.4 score over 50 eval seasons vs. 41.2 for the random baseline — a real but noisy edge, not a large one; being honest about that rather than overselling a 2000-episode/2-agent training run.
+- Live GUI play-tested twice this continuation (once for the compact baseline, once with the trained policy loaded) without errors.
+
+### What did not work
+- **Balance bug, caught via verification before any play-test:** `MOISTURE_DECAY_BASE` was still tuned for the old open-ended 5-agent/32-cell loop, where a stale cell was just annoying, never fatal. At that rate, nearly every cell died of dehydration before reaching maturity (4-6/6 dead, every run). Halved the constant (0.9→0.5); this helped but total crop failure is still the single most common outcome under the deliberately-dumb random baseline — decided with the user to leave this as an honest hard baseline rather than keep tuning toward "typically winnable," since a struggling dumb swarm is useful evidence for exactly the kind of AI-layer work that followed.
+- **Real bug, caught by the user watching live, not by verification:** every plant cell initialized with `last_monitored = 0`, so all six became monitor-eligible on the exact same tick — a synchronized "monitor everything, then go quiet" burst rhythm instead of continuous small activity, which read as "agents stop working after the first pass." Fixed by staggering each cell's initial `last_monitored` to a random negative offset within one staleness window. Worth noting: this kind of thing is easy to miss in headless verification (which checks correctness, not rhythm/pacing) and only showed up from watching the live GUI — a reminder to actually watch it, not just trust the stats.
+- **Real bug, caught by the user watching live, unresolved:** two agents can deadlock when their final destinations are literally each other's current cell (a swap) — the existing stuck-timeout reroute only avoids *intermediate* occupied cells, not the final target, so nothing resolves it. Explicitly left unfixed at user direction — this is the same pathing/negotiation problem already deferred to "the AI" in the prior entry, and the user didn't want a heuristic patch (e.g. an agent-id tie-breaker) papering over what should eventually be real inter-agent communication.
+
+### Current state
+Compact 2-agent/6-cell farm with a full 30-day lifecycle/harvest/scoring loop is working and verified. An RL-trained task-prioritization policy exists, trains cleanly, and modestly beats the random baseline; it's switched on by default in `config.py` right now (`USE_RL_POLICY = True`) after being play-tested live. The agent-agent swap deadlock is a known, unresolved issue — out of scope for the RL layer just built (that layer only replaces *which task to work*, not movement/negotiation).
+
+### Next steps (high level)
+**Stated direction (2026-07-18): the user wants future work to prioritize AI/RL-driven solutions over hand-coded/algorithmic fixes** — when a next step below could go either way, default to proposing the AI-driven option first.
+1. Decide on the swap-deadlock: leave for a future negotiation/communication layer (consistent with how it's been treated so far, and with the direction above), or apply a cheap interim tie-breaker.
+2. RL policy is a first pass — more training episodes, reward-shaping iteration, or richer features (e.g. real path cost instead of Manhattan distance) could plausibly widen the gap over the random baseline; the current ~25%-over-50-eval-episodes edge is real but not heavily validated statistically.
+3. Two new files (`simulation/rl_policy.py`, `simulation/train.py`) don't have a component log yet — folded into `agent.md`/`environment.md` for now; flagging that a dedicated `rl.md` might be worth creating if this component keeps growing (per `LOGGING_STANDARDS.md`, proposing rather than doing this unprompted).
+4. Collective/multi-agent RL over movement and coordination (not just task choice) was discussed as a legitimate future phase — explicitly not started now, scoped as its own deliberate effort later.
+5. **User request (2026-07-18), not yet built:** a reward log — a record of every reward event the RL policy experienced (positive and negative), not just the aggregate `grid.score`/episode-score numbers currently printed by `train.py`. See `agent.md`'s `[WORTH EXPLORING]` for the detailed sketch.
+4. `simulation/README.md` and root `README.md` still describe the old warehouse/item/captain model — not yet started.

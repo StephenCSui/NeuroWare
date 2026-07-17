@@ -12,6 +12,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Trained RL policy weights — generated artifact, regenerate via train.py
+simulation/models/
+
 # OS
 .DS_Store
 Thumbs.db
