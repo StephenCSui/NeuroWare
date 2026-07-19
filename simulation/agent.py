@@ -2,8 +2,9 @@ import math
 import random
 import pygame
 from config import (AGENT_SIZE, AGENT_SPEED, BUSY_CHANCE, BUSY_DURATION,
-                    COLORS, TASK_DURATIONS, WATER_REFILL_AMOUNT, STUCK_REROUTE_FRAMES,
-                    HARVEST_REWARD, WATER_REWARD, WEED_REWARD)
+                    COLORS, TASK_DURATIONS, WATER_REFILL_AMOUNT, WATER_CAPACITY, STUCK_REROUTE_FRAMES,
+                    HARVEST_REWARD, WATER_REWARD, WEED_REWARD, DEATH_PENALTY)
+
 
 
 class Agent:
@@ -27,9 +28,11 @@ class Agent:
         self._task_type  = None   # "monitor" | "weed" | "water" | "obtain_water"
         self._task_timer = 0.0
 
-        # Water resource — consumed by one "water" task, must be refilled at a
-        # water cell before the agent can water again. Starts full.
-        self.water = True
+        # Water resource — one water-cell visit is worth WATER_CAPACITY
+        # waterings before another trip is needed (>1 specifically to cut
+        # down how often watering requires a full round-trip relative to
+        # weeding, which has no such travel cost). Starts full.
+        self.water_charges = WATER_CAPACITY
 
         # Harvest carrying capacity — one at a time, mirrors the water flag:
         # while True, delivering to the harvest box is the only action considered.
@@ -45,6 +48,21 @@ class Agent:
         self.last_action = None
         self.last_reward = None
 
+        # Team-level death hits accumulate here (grid.py, on cell death) and
+        # ride along on whatever real task-completion reward resolves next --
+        # keeps last_reward's "task actually finished" timing intact instead
+        # of forcing a Q-transition closed mid-travel.
+        self.pending_penalty = 0.0
+
+        # Longer-lived twin of last_state/last_action — set by TaskPolicy.select()
+        # at the same time, but NOT cleared by train.py's per-tick bookkeeping.
+        # Read by _should_yield() to arbitrate a swap-deadlock conflict against
+        # the Q-value of what this agent is *currently* committed to doing;
+        # last_action alone goes stale mid-episode during training once it's
+        # been consumed into a Q-learning transition.
+        self.committed_state  = None
+        self.committed_action = None
+
     # ------------------------------------------------------------------
     # Movement — grid-stepped, occupancy-reserved
     # ------------------------------------------------------------------
@@ -52,7 +70,12 @@ class Agent:
     def _move_toward(self, tx, ty, speed):
         dx, dy = tx - self.x, ty - self.y
         dist = math.hypot(dx, dy)
-        if dist < 1.5:
+        # Snap once the remaining distance is within one step -- a fixed
+        # threshold smaller than `speed` lets a single step overshoot the
+        # target and bounce back past it forever (never landing inside the
+        # threshold band), which is exactly what TIME_SCALE-driven AGENT_SPEED
+        # increases exposed.
+        if dist <= speed:
             self.x, self.y = tx, ty
             return True
         self.x += (dx / dist) * speed
@@ -89,15 +112,27 @@ class Agent:
                 self._path.pop(0)
                 self._stuck_frames = 0
             else:
-                self._stuck_frames += 1
-                if self._stuck_frames > STUCK_REROUTE_FRAMES:
-                    # Stuck on this exact cell too long (likely another agent
-                    # waiting right back at us) — reroute around current traffic.
-                    rerouted = grid.shortest_path(self.current_cell, target_cell, avoid_occupied=True)[1:]
-                    if rerouted:
-                        self._path = rerouted
-                    self._stuck_frames = 0
-                return False   # temporarily blocked by another agent — wait this frame, retry next
+                blocker = self._find_agent(grid, next_cell.occupied_by)
+                mutual_swap = (
+                    next_cell is target_cell and blocker is not None and
+                    blocker._target_cell is self.current_cell
+                )
+                if mutual_swap and self._should_yield(blocker):
+                    # Reroute is provably useless for a true swap (the target
+                    # itself is what's occupied) — step aside immediately
+                    # instead of waiting out STUCK_REROUTE_FRAMES first.
+                    self._step_aside(grid)
+
+                if self._moving_to_cell is None:
+                    self._stuck_frames += 1
+                    if self._stuck_frames > STUCK_REROUTE_FRAMES:
+                        # Stuck on this exact cell too long (likely another agent
+                        # waiting right back at us) — reroute around current traffic.
+                        rerouted = grid.shortest_path(self.current_cell, target_cell, avoid_occupied=True)[1:]
+                        if rerouted:
+                            self._path = rerouted
+                        self._stuck_frames = 0
+                    return False   # temporarily blocked by another agent — wait this frame, retry next
 
         tx, ty = self._moving_to_cell.center()
         if self._move_toward(tx, ty, AGENT_SPEED):
@@ -106,6 +141,63 @@ class Agent:
             self._moving_to_cell = None
 
         return self.current_cell is target_cell
+
+    def _find_agent(self, grid, agent_id):
+        if agent_id is None:
+            return None
+        for a in getattr(grid, "agents", []):
+            if a.agent_id == agent_id:
+                return a
+        return None
+
+    def _current_action_value(self):
+        """Q-value of what this agent is currently committed to doing, or
+        None if there isn't one (random-choice baseline, or mid personal
+        water/harvest trip — neither is a policy decision)."""
+        if self.policy is None or self.committed_state is None or self.committed_action is None:
+            return None
+        return float(self.policy._predict(self.committed_state)[self.committed_action])
+
+    def _should_yield(self, other):
+        """Deterministic three-tier comparison for a detected mutual swap —
+        both agents evaluate this independently off shared state and always
+        reach opposite conclusions, so no negotiation channel is needed for
+        them to agree on who moves. Tier 1: whoever's current committed
+        action has the lower learned Q-value yields (less to lose by
+        backing off) — reuses the already-trained policy, no new model.
+        Tier 2 (no Q-values available, e.g. the random baseline, or an exact
+        tie): whoever claimed their target more recently yields — first-come-
+        first-served, not identity-based. Tier 3 (everything else tied):
+        agent_id, purely to guarantee exactly one of the two yields."""
+        my_v, other_v = self._current_action_value(), other._current_action_value()
+        if my_v is not None and other_v is not None and my_v != other_v:
+            return my_v < other_v
+
+        my_tick    = getattr(self._target_cell, "claim_tick", None)
+        other_tick = getattr(other._target_cell, "claim_tick", None)
+        my_tick    = my_tick if my_tick is not None else float("inf")
+        other_tick = other_tick if other_tick is not None else float("inf")
+        if my_tick != other_tick:
+            return my_tick > other_tick
+
+        return self.agent_id > other.agent_id
+
+    def _step_aside(self, grid):
+        """Break a mutual swap: move toward any free neighboring cell other
+        than the contested target, freeing my current cell so the other
+        agent (who holds priority) can advance into it. Cached path/target
+        are left alone except for invalidating _path — once I've stepped
+        clear, normal step_toward re-plans toward my real target on its own."""
+        options = [
+            n for n in grid.neighbors(self.current_cell)
+            if n.is_occupiable() and n is not self._target_cell
+        ]
+        if not options:
+            return   # boxed in — fall through to the normal stuck/reroute safety net
+        detour = random.choice(options)
+        detour.occupy(self.agent_id)
+        self._moving_to_cell = detour
+        self._path = None
 
     def _pick_random_target(self, grid):
         # Deadspace is a hard barrier now — never wander toward a cell that can't be entered
@@ -169,6 +261,9 @@ class Agent:
         self._task_type   = "obtain_water"
         self._task        = "moving_to_task"
         self._task_timer  = 0.0
+        # Not a policy decision — no Q-value exists for it, don't let a
+        # swap-conflict check compare against a stale prior task's value.
+        self.committed_state = self.committed_action = None
 
     def _begin_deliver(self, grid):
         """Carrying a harvest — head straight to the harvest box to drop it
@@ -178,6 +273,7 @@ class Agent:
         self._task_type   = "deliver_harvest"
         self._task        = "moving_to_task"
         self._task_timer  = 0.0
+        self.committed_state = self.committed_action = None
 
     # ------------------------------------------------------------------
     # Update
@@ -195,7 +291,7 @@ class Agent:
             if self.carrying_harvest:
                 # Both hands full — nothing else to consider until it's delivered.
                 self._begin_deliver(grid)
-            elif not self.water:
+            elif self.water_charges <= 0:
                 # Out of water takes priority over any other task — must refill first.
                 self._begin_refill(grid)
             elif random.random() < BUSY_CHANCE:
@@ -241,7 +337,7 @@ class Agent:
         self.last_reward = 0.0   # overwritten below for water/weed/deliver_harvest — RL bookkeeping, harmless otherwise
 
         if self._task_type == "obtain_water":
-            self.water = True   # refilled — nothing was claimed, nothing to release
+            self.water_charges = WATER_CAPACITY   # refilled — nothing was claimed, nothing to release
         elif self._task_type == "deliver_harvest":
             self.carrying_harvest = False   # dropped off — nothing was claimed, nothing to release
             grid.score += HARVEST_REWARD
@@ -249,7 +345,7 @@ class Agent:
         else:
             if self._task_type == "water":
                 cell.moisture = min(100.0, cell.moisture + WATER_REFILL_AMOUNT)
-                self.water = False   # consumed — must refill before watering again
+                self.water_charges -= 1   # consumed one charge — refill once it hits 0
                 grid.score += WATER_REWARD
                 self.last_reward = WATER_REWARD
             elif self._task_type == "weed":
@@ -265,10 +361,17 @@ class Agent:
                 cell.observe(tick)   # water/weed also count as an observation — agent is right there
             cell.release()
 
+        if self.pending_penalty != 0.0:
+            self.last_reward     += self.pending_penalty
+            self.pending_penalty  = 0.0
+
+        grid.reward_log.record(tick, grid.day_count, self.agent_id, self._task_type, cell, self.last_reward)
+
         self._task        = None
         self._task_type   = None
         self._target_cell = None
         self._task_timer  = 0.0
+        self.committed_state = self.committed_action = None
 
     def _release_and_reset(self):
         if self._target_cell is not None and self._target_cell.claimed_by == self.agent_id:
@@ -280,6 +383,7 @@ class Agent:
         self._task_type   = None
         self._target_cell = None
         self._task_timer  = 0.0
+        self.committed_state = self.committed_action = None
         self._path          = None
         self._path_target   = None
         self._stuck_frames  = 0

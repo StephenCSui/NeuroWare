@@ -15,6 +15,9 @@ __pycache__/
 # Trained RL policy weights — generated artifact, regenerate via train.py
 simulation/models/
 
+# Per-event reward log — generated artifact, written on quit (see reward_log.py)
+simulation/reward_logs/
+
 # OS
 .DS_Store
 Thumbs.db

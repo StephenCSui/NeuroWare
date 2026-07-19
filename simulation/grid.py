@@ -1,13 +1,16 @@
 import random
 import heapq
 import pygame
+from reward_log import RewardLog
+from death_log import DeathLog
 from config import (
     CELL_SIZE, GRID_COLS, GRID_ROWS,
     HARVEST_BOX, WATER_REGION, PLANT_REGION,
     MOISTURE_LOW_THRESHOLD, WEED_HIGH_THRESHOLD, STALENESS_THRESHOLD_TICKS,
     MOISTURE_DECAY_BASE, WEED_SPROUT_CHANCE, WEED_SPROUT_MIN, WEED_SPROUT_MAX,
     CLAIM_TIMEOUT_TICKS, COLORS,
-    DAY_LENGTH_TICKS, DAYS_TO_MATURE, SEASON_LENGTH_DAYS,
+    DAY_LENGTH_TICKS, DAYS_TO_MATURE, SEASON_LENGTH_DAYS, DEATH_PENALTY,
+    DEHYDRATION_BLEED_THRESHOLD, DEHYDRATION_BLEED_RATE,
 )
 
 
@@ -72,9 +75,12 @@ class Cell:
     # ------------------------------------------------------------------
 
     def _is_active(self):
-        # Only a growing or ready plant can still need anything — terminal
-        # cells (harvested/dead/spoiled) are done for the season.
-        return self.cell_type == "plant" and self.status in ("growing", "ready")
+        # Only a still-growing plant needs maintenance or drifts at all --
+        # once "ready" it's frozen (no water/weed/monitor needs, no decay,
+        # no neglect-death risk) for the whole harvest window, the only
+        # thing left to do with it is collect it. Terminal cells
+        # (harvested/dead/spoiled) are done for the season either way.
+        return self.cell_type == "plant" and self.status == "growing"
 
     def needs_water(self):
         if not self._is_active() or self.known_moisture is None:
@@ -145,6 +151,8 @@ class Cell:
             return COLORS["water"]
         if self.status in ("harvested", "dead", "spoiled"):
             return COLORS[self.status]
+        if self.status == "growing" and self.moisture <= DEHYDRATION_BLEED_THRESHOLD:
+            return COLORS["bleeding"]   # true state, overrides "unknown" too -- this is for the human watching, not the swarm's own knowledge
         if self.known_moisture is None:
             return COLORS["unknown"]
 
@@ -167,6 +175,8 @@ class Grid:
         self.day_count   = 0
         self.season_over = False
         self.score       = 0.0
+        self.reward_log  = RewardLog()
+        self.death_log   = DeathLog()
         self.cells       = self._build_layout()
 
     def _build_layout(self):
@@ -293,13 +303,34 @@ class Grid:
         self.day_count   = self.tick_count // DAY_LENGTH_TICKS
         for cell in self.plant_cells():
             cell.tick(dt)
-            if cell.status in ("growing", "ready"):
+            if cell.status == "growing":
+                if cell.moisture <= DEHYDRATION_BLEED_THRESHOLD:
+                    bleed = DEHYDRATION_BLEED_RATE * dt
+                    self.score += bleed
+                    for agent in self.agents:
+                        agent.pending_penalty += bleed
+
+                # Death is only a growing-phase risk now -- once "ready",
+                # true state is frozen (Cell._is_active()), so neither
+                # condition below can even trigger during the harvest window.
                 dehydrated = cell.moisture <= 0.0
                 overweeded = cell.weed_density >= 100.0
                 both_bad   = cell.moisture <= 20.0 and cell.weed_density >= 80.0
                 if dehydrated or overweeded or both_bad:
+                    if dehydrated and overweeded:
+                        cause = "both"
+                    elif dehydrated:
+                        cause = "dehydration"
+                    elif overweeded:
+                        cause = "weeds"
+                    else:
+                        cause = "both"   # only the combined (both_bad) threshold fired
                     cell.status = "dead"
-                elif cell.status == "growing" and self.day_count >= DAYS_TO_MATURE:
+                    self.death_log.record(self.tick_count, self.day_count, cell, cause)
+                    self.score += DEATH_PENALTY
+                    for agent in self.agents:
+                        agent.pending_penalty += DEATH_PENALTY
+                elif self.day_count >= DAYS_TO_MATURE:
                     cell.status = "ready"
         if self.day_count >= SEASON_LENGTH_DAYS:
             self.season_over = True

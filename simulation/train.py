@@ -13,16 +13,25 @@ from rl_policy import TaskPolicy, build_observation, build_action_mask
 
 DT           = 1.0 / FPS   # must match runtime dt -- decay/sprout/task durations are all dt-scaled
 NUM_EPISODES = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
+# Optional agent-count override -- proves the observation/action shapes in
+# rl_policy.py don't hard-code a specific swarm size (see build_observation's
+# swarm-context block). Training itself is still per-agent-count: a policy
+# trained here is only valid for this many agents.
+TRAIN_NUM_AGENTS = int(sys.argv[2]) if len(sys.argv) > 2 else NUM_AGENTS
 EVAL_EPISODES = 50
-LOG_EVERY    = 100
+LOG_EVERY    = int(sys.argv[3]) if len(sys.argv) > 3 else min(100, max(1, NUM_EPISODES // 8))
 
 
-def run_episode(policy, train=True):
-    """Plays one season. If train, feeds Q-learning updates as decisions
-    resolve and returns the final score. If not train, policy acts greedily
-    (or randomly, if policy is None) with no learning -- used for eval."""
+def run_episode(policy, train=True, num_agents=None):
+    """Plays one season. If train, buffers Q-learning transitions as decisions
+    resolve and refits the policy once at the end of the episode, returning
+    the final score. If not train, policy acts greedily (or randomly, if
+    policy is None) with no learning -- used for eval."""
+    if num_agents is None:
+        num_agents = TRAIN_NUM_AGENTS
     grid   = Grid()
-    agents = [Agent(i, cell, policy=policy) for i, cell in enumerate(grid.spawn_points(NUM_AGENTS))]
+    agents = [Agent(i, cell, policy=policy) for i, cell in enumerate(grid.spawn_points(num_agents))]
+    grid.agents = agents   # lets build_observation see the rest of the swarm
     # Eval mode with a real policy: force greedy (epsilon=0) for the episode,
     # restore afterward so training's own schedule isn't disturbed.
     saved_epsilon = None
@@ -53,6 +62,9 @@ def run_episode(policy, train=True):
     if saved_epsilon is not None:
         policy.epsilon = saved_epsilon
 
+    if train and policy is not None:
+        policy.refit()
+
     return grid.score
 
 
@@ -63,12 +75,14 @@ def evaluate(policy, n=EVAL_EPISODES):
 
 def main():
     policy = TaskPolicy(epsilon=1.0)
+    print(f"training with {TRAIN_NUM_AGENTS} agent(s)")
 
     for ep in range(1, NUM_EPISODES + 1):
         policy.epsilon = max(0.05, 1.0 - ep / NUM_EPISODES)
         score = run_episode(policy, train=True)
         if ep % LOG_EVERY == 0:
-            print(f"episode {ep:5d}/{NUM_EPISODES}  score={score:6.1f}  epsilon={policy.epsilon:.3f}")
+            print(f"episode {ep:5d}/{NUM_EPISODES}  score={score:6.1f}  "
+                  f"epsilon={policy.epsilon:.3f}  buffer={len(policy.buffer)}")
 
     os.makedirs(os.path.dirname(POLICY_WEIGHTS_PATH), exist_ok=True)
     policy.save(POLICY_WEIGHTS_PATH)

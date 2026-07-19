@@ -1,8 +1,9 @@
+import os
 import sys
 import pygame
 
 from config import (WINDOW_WIDTH, WINDOW_HEIGHT, FPS, COLORS, NUM_AGENTS, CELL_SIZE,
-                    USE_RL_POLICY, POLICY_WEIGHTS_PATH)
+                    USE_RL_POLICY, POLICY_WEIGHTS_PATH, REWARD_LOG_PATH, DEATH_LOG_PATH)
 from grid  import Grid
 from agent import Agent
 
@@ -55,6 +56,7 @@ def main():
 
     grid   = Grid()
     agents = [Agent(i, cell, policy=policy) for i, cell in enumerate(grid.spawn_points(NUM_AGENTS))]
+    grid.agents = agents   # lets build_observation see the rest of the swarm
 
     paused = False
     dt     = 1.0 / FPS
@@ -99,6 +101,11 @@ def main():
 
         pygame.display.flip()
         clock.tick(FPS)
+
+    os.makedirs(os.path.dirname(REWARD_LOG_PATH), exist_ok=True)
+    grid.reward_log.save(REWARD_LOG_PATH)
+    grid.death_log.save(DEATH_LOG_PATH)
+    print(f"deaths this run: {grid.death_log.summary()}")
 
     pygame.quit()
     sys.exit()
