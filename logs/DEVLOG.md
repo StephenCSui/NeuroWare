@@ -230,3 +230,33 @@ Isaac Sim 6.0.0 is installed and confirmed runnable on this hardware using the l
 3. Once physically proven in Isaac, port the validated pygame transport design (recruitment, readiness gate, routing) rather than redesigning from scratch — carried over from Session 5
 4. RL decision layer still not started — deliberately sequenced after the mechanical pipeline is proven, per the same lesson learned in the farm project
 5. `transport.md` (and/or an Isaac-specific component log, given how much setup/render-configuration history already exists) still proposed, not created — pending confirmation
+
+---
+
+## Session 6 (continued) — NeuroWare (2026-08-09)
+
+### What was done
+- Found and reused an existing reference robot model (`gitignore/paper_robot_centered_actuator_v6`, predates this project's visible session history) instead of building a placeholder from scratch — a centered piston lift, a ball-joint contact plate for conforming to angled surfaces, and skid-steer wheels, built to match a reference paper's described mechanism rather than sourced from the paper itself. Fits the underneath-lift coupling concept well
+- Imported the robot into Isaac Sim (URDF → USD → PhysX articulation) and let it settle under real gravity onto a ground plane, using the same low-VRAM rendering path validated earlier this session — confirmed the whole import pipeline works end to end on this hardware, staying well within the VRAM budget
+- Began wiring up real joint-level control (drive gains, velocity targets for the wheels, with position control for the piston lift planned next) — user is hand-writing this control code directly as a learning exercise, with iterative debugging support rather than the code being written for them
+- Got the wheels physically responding to velocity commands under real physics — confirmed by direct observation after fixing a couple of API usage mistakes
+- Started into keyboard-driven manual control as the next step; not completed yet, deliberately stopped here
+- Worked through and settled the design approach for the coupling mechanism itself: a two-phase plan (rigid physics joint first, to prove the multi-robot coordination/negotiation logic without depending on real holding physics; real contact/friction-based holding second, to actually test whether an object stays on/between the robots during motion) plus a refinement that deliberately-unrealistic object shapes are valid as pure navigation stress tests for phase one, while realistic-but-awkward shapes are reserved for phase two
+
+### What worked
+- The existing reference robot model imported cleanly with working physics (rigid bodies, joints) despite some benign warnings (zero-mass intermediate ball-joint links with no geometry of their own, missing joint gain values from the source URDF) — neither was a real blocker
+- Manually setting joint drive gains and velocity targets got the wheels genuinely spinning/driving under real physics once the control code's API usage was corrected
+
+### What did not work
+- Initial hand-written control code had two parameter-naming mistakes when calling the joint-control API — caught by actually running it and reading the real error each time, not by guessing, and fixed both times
+- Keyboard control not yet implemented
+
+### Current state
+A drivable robot now exists in Isaac Sim under real physics (imported from the reference model, wheels respond to hardcoded velocity targets), but it is not yet keyboard-controllable, the piston lift and ball joint are untested, and no coupling mechanism (joint-based or friction-based) has been built yet. This session was entirely about getting a controllable robot into the scene — no actual transport/coupling logic has been ported over yet.
+
+### Next steps (high level)
+1. Finish keyboard-driven manual control of the wheels
+2. Test the piston (position control) and ball joint, confirm the lift mechanism behaves as expected
+3. Build the phase-one coupling mechanism (rigid joint between the robot's contact plate and a test object) once the robot is reliably drivable
+4. Phase two (real contact/friction-based holding) once phase one proves the coordination logic works
+5. Carried over from earlier: RL decision layer still not started; `transport.md` / an Isaac-specific component log still proposed, not created — pending confirmation
