@@ -165,3 +165,36 @@ Push model fully redesigned and operational. The three end-of-session fixes (`_s
 2. Tune push speed multipliers (2.0/1.0/0.7) against observed agent behaviour
 3. Tune `PUSH_FORCE`, `ITEM_DAMPING`, `PUSH_SPEED_MAX` for physical feel
 4. Add item log (item.py was completely rewritten and has no component log yet)
+
+---
+
+## Session 5 — NeuroWare (2026-07-22)
+
+### What was done
+- Major project pivot: from the warehouse push-model simulation (Sessions 1-4) toward cooperative multi-robot object transport — several small robots physically combining to move objects too large/heavy for one robot alone. Motivated by wanting genuine real-world economic viability (a niche standard single-robot warehouse automation doesn't cover) rather than an abstract swarm-robotics concept
+- New branch `transport` created off `main`. The separate farm-swarm pivot (branch `farm`, its own divergent history) is left untouched as historical reference, not merged or continued
+- Settled architecture: two-layer design — classical/deterministic control for physical coordination (positioning, coupling, movement), with a learned decision layer reserved for team-formation/task-allocation (which robots combine, for which object) once the mechanical layer is proven. Low-level physical control deliberately not a target for RL
+- Isaac Sim chosen as the eventual target platform (industry relevance, real sim-to-real pathway); Isaac Lab (the RL-training layer) deliberately not needed yet since no parallel training is planned until hardware/compute allows it
+- Built a logic-only pygame prototype (`transport/`) to validate the design before touching Isaac Sim: continuous-space robots, a warehouse grid for shelf/obstacle bookkeeping (mirrors `simulation/grid.py`'s Cell/Grid pattern), BFS routing, deterministic nearest-robot task assignment as a placeholder for a future RL layer
+- Redesigned the warehouse layout mid-session (from an open pickup/dropoff room to a real shelf-based layout, per a reference screenshot): robots recruit at shelf slots restricted to the specific segment currently holding an object (not the whole shelf), lift it Kiva-style from underneath (not perimeter-anchored), and carry it to a dropoff zone through a deliberately tight corridor
+- Established a real baseline measurement (`eval_baseline.py`, same role as `simulation/eval_harvest_rate.py` in the farm project) before any RL work: recruitment speed, straggler lag, full cycle time, throughput
+
+### What worked
+- End-to-end pipeline functions: shelf slot restocking, robot recruitment via BFS routing, a readiness gate (won't lock until every recruited robot is physically in position, not just assigned), and decentralized local-force "negotiation" for threading the group + object through the warehouse corridor without a pre-planned route
+- Footprint-aware routing (BFS validated against the object's actual bounding box, not a single point) and object-object collision were both added mid-session and measurably improved delivery throughput across varied random seeds
+
+### What did not work
+- Local force-vote ("potential field") navigation has a real, recurring local-minima failure mode: a group's vote can land on a near-zero net direction along the only unblocked axis at certain positions, causing long stalls. Root-caused (not guessed) via direct tick-by-tick tracing each time it recurred. Fixed twice in different specific forms (a shelf-escape lateral-shuffle bug, then a general object-width-vs-single-point-routing mismatch), but the underlying category of failure was not eliminated — judged to be a genuine motion-planning problem, not something worth continuing to patch in pygame
+- No object rotation is supported — objects can only translate, not turn to angle through a tight passage. Known and deliberately deferred, not attempted this session
+
+### Current state
+Transport prototype is functional end-to-end (recruit → lift → navigate → deliver) with a real, working warehouse/shelf layout, but the negotiation/transport phase has an accepted residual deadlock risk and no rotation support — both explicitly parked in favor of moving to Isaac Sim, where real physics/motion planning is the appropriate tool rather than further pygame force-tuning. No RL has been introduced yet; the deterministic nearest-robot assignment is the only decision-making in place so far.
+
+### Next steps (high level)
+1. Begin hands-on Isaac Sim setup (scene basics, URDF import) — starting point for proving the underneath-lift anchor mechanism in real physics
+2. Once physically proven in Isaac, port the validated pygame design (recruitment, readiness gate, routing) rather than redesigning from scratch
+3. RL decision layer (team/slot assignment) still not started — deliberately sequenced after the deterministic mechanical pipeline was proven, per the same lesson learned in the farm project
+4. Consider a dedicated `transport.md` component log given the amount of bug/fix history already accumulating in this prototype — not created yet, pending confirmation
+
+### Stretch goals (unscheduled)
+- Space-optimization slotting: real warehouses maximize storage by fitting complementary-shaped items into a shared slot and re-slotting (relocating) items over time to improve space utilization, not just fixed one-object-per-slot placement. Current `ShelfSlot` model holds exactly one object regardless of size fit. Noted as a possible future decision problem (well suited to the RL layer) — not in scope for the current mechanical/transport-coordination work
