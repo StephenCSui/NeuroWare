@@ -198,3 +198,35 @@ Transport prototype is functional end-to-end (recruit → lift → navigate → 
 
 ### Stretch goals (unscheduled)
 - Space-optimization slotting: real warehouses maximize storage by fitting complementary-shaped items into a shared slot and re-slotting (relocating) items over time to improve space utilization, not just fixed one-object-per-slot placement. Current `ShelfSlot` model holds exactly one object regardless of size fit. Noted as a possible future decision problem (well suited to the RL layer) — not in scope for the current mechanical/transport-coordination work
+
+---
+
+## Session 6 — NeuroWare (2026-08-09)
+
+### What was done
+- Committed the Session 5 transport prototype to git on the `transport` branch (DEVLOG entry + all prototype files). Two unrelated untracked artifacts from earlier farm-branch RL training work were deliberately left out of the commit, not deleted
+- Play-tested the pygame transport prototype live; directly observed the known negotiation stall (documented in Session 5) occurring specifically around the middle shelf region — confirmed as the same already-logged limitation, not a new bug
+- Downloaded, installed, and did initial bring-up of Isaac Sim 6.0.0 (standalone workstation build) on this machine, ahead of porting the transport design into real physics
+- Ran Isaac Sim's official compatibility checker: confirmed a hard VRAM shortfall on this machine's GPU (well under the stated minimum) while every other requirement (driver, CPU, RAM, storage, OS) passed. Also surfaced an IOMMU-related stability warning (potential memory corruption risk under CUDA on bare-metal Linux with IOMMU enabled) — not resolved this session, would require a BIOS-level change
+- First interactive launch attempt, using the default renderer settings, crashed immediately after startup completed. Root cause not provable with certainty (no root access to kernel/driver logs in this environment), but strongly consistent with GPU memory exhaustion during the default renderer's initialization, matching the compatibility checker's finding
+- Found and validated a low-VRAM interactive rendering path that avoids the crash entirely, and used it to build a small test scene (lit object, ground plane, camera framing) as a working starting template
+- Iteratively tuned the test scene based on direct visual feedback (screenshots) rather than assumption: fixed an initial black-viewport bug, added real directional lighting (the first lighting attempt was ambient-only and produced a flat, edgeless look), added a ground plane so the background isn't empty black, and fixed initial camera framing to start close on the test object
+- Moved the test script from inside the Isaac Sim install directory into the git repo (new `isaac/` folder), confirmed it still runs correctly from there — keeps the actual Isaac Sim install (tens of GB) out of git entirely while the project's own scripts stay version-controlled
+
+### What worked
+- The low-VRAM rendering path is a confirmed, working solution for this GPU — the interactive viewport stayed well within budget (roughly a quarter of total VRAM) throughout all testing, comfortable headroom for building an actual scene
+- Diagnosing the black-viewport issue by reading Isaac Sim's own settings UI/source directly (rather than guessing) resolved it correctly on the first real fix — one piece of SDK documentation elsewhere was stale/misleading and would have led to the wrong conclusion if trusted over the live source
+
+### What did not work
+- Isaac Sim's default interactive renderer is not usable on this hardware — confirmed by direct crash, not just the compatibility checker's static warning
+- IOMMU stability warning surfaced but intentionally not addressed this session (requires BIOS change + reboot, no instability actually observed yet to justify it)
+
+### Current state
+Isaac Sim 6.0.0 is installed and confirmed runnable on this hardware using the low-VRAM rendering path, with a working minimal test scene as a starting template. The default/full-quality renderer does not work on this GPU and should not be used going forward. No actual project content (robot bodies, the coupling mechanism, a real warehouse scene) has been built yet — this session was entirely Isaac Sim bring-up.
+
+### Next steps (high level)
+1. Begin building the actual coupling-mechanism test scene (robot bodies, physics, underneath-lift joint), starting from the validated low-VRAM test scene rather than from scratch
+2. Revisit the IOMMU warning if real instability shows up later — not urgent otherwise
+3. Once physically proven in Isaac, port the validated pygame transport design (recruitment, readiness gate, routing) rather than redesigning from scratch — carried over from Session 5
+4. RL decision layer still not started — deliberately sequenced after the mechanical pipeline is proven, per the same lesson learned in the farm project
+5. `transport.md` (and/or an Isaac-specific component log, given how much setup/render-configuration history already exists) still proposed, not created — pending confirmation
