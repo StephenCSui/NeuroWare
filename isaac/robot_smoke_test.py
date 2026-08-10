@@ -1,8 +1,9 @@
-"""Robot import smoke test -- loads the reference paper_robot_centered_actuator_v6
-URDF (centered piston lift + ball-joint contact plate + skid-steer wheels) into
-Isaac Sim, drops it onto a ground plane, and lets real PhysX gravity settle it.
-Confirms the URDF -> USD -> PhysX articulation pipeline works end to end before
-building any actual coupling-mechanism logic on top of it.
+"""Robot + shelf + payload test scene -- opens the saved shelf/payload layout
+(built by hand in the Isaac Sim GUI, then given physics via one-off scripts:
+static collision on the shelf, dynamic rigid bodies on the payload objects)
+together with the already-embedded robot, and adds keyboard-driven wheel
+control so the robot can be driven up to the shelf to test real collision
+with the payload objects.
 
 Uses the same low-VRAM MinimalRendering setup validated in
 smoke_test_minimal_viewport.py -- this hardware can't run the default
@@ -19,51 +20,25 @@ simulation_app = SimulationApp(launch_config={
     "window_height": 640,
 })
 
-import os
-
 import carb.settings
 import omni.timeline
-import omni.usd
-from pxr import Gf, UsdGeom, UsdLux, UsdPhysics
+import omni.appwindow
+import carb.input
 from omni.kit.viewport.utility import get_active_viewport, frame_viewport_prims
-from isaacsim.core.experimental.objects import GroundPlane
-from isaacsim.core.experimental.utils.stage import add_reference_to_stage
-from isaacsim.asset.importer.urdf import URDFImporter, URDFImporterConfig
+import isaacsim.core.experimental.utils.stage as stage_utils
 from isaacsim.core.experimental.prims import Articulation
-# Hide the built-in reference grid at y=0 -- separate from our own
-# GroundPlane prim, this is Kit's viewport guide overlay. Live-toggleable
+# Hide the built-in reference grid at y=0 -- separate from the scene's own
+# ground plane, this is Kit's viewport guide overlay. Live-toggleable
 # in the GUI too (viewport eye icon -> Grid).
 carb.settings.get_settings().set("/app/viewport/grid/enabled", False)
 
-stage = omni.usd.get_context().get_stage()
-UsdGeom.Xform.Define(stage, "/World")
-
-UsdPhysics.Scene.Define(stage, "/World/physicsScene")
-
-UsdLux.DomeLight.Define(stage, "/World/DomeLight").CreateIntensityAttr(300)
-distant = UsdLux.DistantLight.Define(stage, "/World/KeyLight")
-distant.CreateIntensityAttr(2500)
-distant.CreateAngleAttr(2.0)
-UsdGeom.Xformable(distant).AddRotateXYZOp().Set(Gf.Vec3f(-45, 35, 0))
-
-GroundPlane("/World/GroundPlane", sizes=50, colors="gray", templates=None)
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-URDF_PATH = os.path.join(
-    REPO_ROOT, "gitignore", "paper_robot_centered_actuator_v6",
-    "ros_gazebo", "paper_robot_centered_actuator_v6.urdf",
-)
-
-import_config = URDFImporterConfig(urdf_path=URDF_PATH, fix_base=False)
-robot_usd_path = URDFImporter(import_config).import_urdf()
-print(f"[robot smoke test] imported URDF -> {robot_usd_path}")
-
-add_reference_to_stage(robot_usd_path, "/World/Robot")
-
-# Start the robot a little above the floor so it visibly settles under
-# gravity rather than spawning already interpenetrating the ground plane.
-UsdGeom.Xformable(stage.GetPrimAtPath("/World/Robot")).AddTranslateOp().Set(Gf.Vec3d(0, 0, 0.2))
-
+# Not in the repo -- built by hand in the Isaac Sim GUI (Create > Shape),
+# then given physics via one-off scripts: static collision on /World/Shelf,
+# dynamic rigid bodies (CollisionAPI + RigidBodyAPI) on the 4 payload prims.
+# Already contains the robot too (imported once, referenced at /World/Robot).
+SHELF_USD_PATH = "/home/steph/isaac worlds/shelves1_with_collision.usd"
+success, stage = stage_utils.open_stage(SHELF_USD_PATH)
+print(f"[robot smoke test] opened {SHELF_USD_PATH} -> {success}")
 
 for _ in range(5):
     simulation_app.update()
@@ -73,14 +48,65 @@ frame_viewport_prims(get_active_viewport(), ["/World/Robot"])
 omni.timeline.get_timeline_interface().play()
 
 robot = Articulation("/World/Robot/Geometry/base_link")
-wheel_joints = robot.get_joint_indices(["front_left_wheel_joint", "front_right_wheel_joint", "rear_left_wheel_joint", "rear_right_wheel_joint"])
+# dof_indices= expects positions into dof_names (drivable DOFs only), not
+# joint_names (which also includes fixed joints and shifts every index).
+# get_dof_indices resolves against the correct space -- get_joint_indices
+# does not, and silently produces indices that land on the wrong DOFs.
+wheel_joints = robot.get_dof_indices(["front_left_wheel_joint", "front_right_wheel_joint", "rear_left_wheel_joint", "rear_right_wheel_joint"])
+
+input_interface = carb.input.acquire_input_interface()
+keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+
+held_keys = set()
+def on_key_event(e):
+    if e.type == carb.input.KeyboardEventType.KEY_PRESS:
+        held_keys.add(e.input)
+    elif e.type == carb.input.KeyboardEventType.KEY_RELEASE:
+        held_keys.discard(e.input)
+    return True
+
+input_interface.subscribe_to_keyboard_events(keyboard, on_key_event)
 
 robot.set_dof_gains(stiffnesses=0, dampings=5000.0, dof_indices=wheel_joints)
-robot.set_dof_velocity_targets(10, dof_indices=wheel_joints)
+robot.set_dof_velocity_targets(0, dof_indices=wheel_joints)
+
+# The piston and ball-joint stack have no drive at all by default (importer
+# warned "actuator will be created without gain parameters") -- they're free
+# to flop under gravity/motion with poorly-estimated inertia. Damping them
+# to a zero velocity target stops that free flopping without locking them
+# rigidly in place.
+passive_joints = robot.get_dof_indices([
+    "centered_piston_prismatic_z", "ball_roll_revolute", "ball_pitch_revolute", "ball_yaw_revolute",
+])
+robot.set_dof_gains(stiffnesses=0, dampings=50.0, dof_indices=passive_joints)
+robot.set_dof_velocity_targets(0, dof_indices=passive_joints)
 
 print("[robot smoke test] physics running -- robot should settle onto the ground plane under gravity")
 
+Base_speed = 5
 while simulation_app.is_running():
+    forward = carb.input.KeyboardInput.W in held_keys
+    backward = carb.input.KeyboardInput.S in held_keys
+    left = carb.input.KeyboardInput.A in held_keys
+    right = carb.input.KeyboardInput.D in held_keys
+
+    speed = 0
+    if forward:
+        speed += Base_speed
+    elif backward:
+        speed -= Base_speed
+
+    left_speed = 0
+    right_speed = 0
+    if left:
+        left_speed -= Base_speed
+        right_speed += Base_speed
+    elif right:
+        left_speed += Base_speed
+        right_speed -= Base_speed
+
+    robot.set_dof_velocity_targets([speed + left_speed, speed + right_speed, speed + left_speed, speed + right_speed], dof_indices=wheel_joints)
+
     simulation_app.update()
 
 simulation_app.close()

@@ -260,3 +260,62 @@ A drivable robot now exists in Isaac Sim under real physics (imported from the r
 3. Build the phase-one coupling mechanism (rigid joint between the robot's contact plate and a test object) once the robot is reliably drivable
 4. Phase two (real contact/friction-based holding) once phase one proves the coordination logic works
 5. Carried over from earlier: RL decision layer still not started; `transport.md` / an Isaac-specific component log still proposed, not created — pending confirmation
+
+---
+
+## Session 7 — NeuroWare (2026-08-10)
+
+### What was done
+- Finished keyboard-driven manual control of the wheels (held-key tracking plus a per-frame differential velocity mapping for forward/back and skid-steer turning), hand-written by the user with debugging support rather than written for them
+- Root-caused and fixed a real control bug: wheel joint indices were being resolved against the wrong index space (the full joint list, which includes non-driven fixed joints, instead of the drivable DOF list), silently misdirecting velocity commands to the wrong wheels — and in one case onto the piston joint instead of a wheel. Found by printing the robot's actual joint/DOF name lists at runtime rather than guessing, not by reasoning about geometry
+- Applied damping to the previously fully-undriven piston and ball-joint stack (no drive at all existed for these before) so they stop flopping freely under gravity, as a secondary stability improvement once the real turning bug above was already fixed
+- Established that the robot's piston lift mechanism points upward from the chassis, meaning any payload needs to be elevated with ground clearance for the robot to drive underneath and reach it — full warehouse shelving is not needed for this, just a simple raised static platform
+- Built a shelf/stand prototype directly in the Isaac Sim GUI (Create menu) rather than guessing dimensions in code, positioned visually against the live robot, and saved it to a standalone USD file
+- Fixed the saved shelf's structure: all pieces had been created as flat siblings of the stage root instead of grouped, so they were reparented under a single new Xform (world positions preserved) via a script-driven fix
+- Added static collision (no rigid body — same treatment as the ground plane) to every piece of the shelf, confirmed as the intended behavior (fixed in place, not affected by gravity) before applying
+
+### What worked
+- The DOF-index fix fully resolved the erratic/scrambled turning that had been reported during control testing — confirmed as the actual root cause once the real joint/DOF name lists were printed and compared
+- Prototyping the shelf visually in the GUI before writing any code was an effective way to dial in placement and size against the robot without guessing numbers blind
+- Reparenting the shelf pieces via the `MovePrim` command with world-transform preservation correctly regrouped everything without shifting any positions
+
+### What did not work
+- Initial suspicion that bad inertia on the piston/ball-joint stack was causing the erratic turning was a plausible-looking but incorrect theory — the real cause was the joint/DOF indexing bug. The damping fix was still worth keeping as a legitimate secondary improvement, just wasn't the actual fix for the reported symptom
+- First attempt to save the manually-built shelf failed — the save dialog defaulted to an Omniverse Nucleus path that isn't reachable in this setup rather than a local disk path. Fixed by explicitly choosing a local path on retry
+
+### Current state
+The robot is now fully keyboard-drivable with correct per-wheel differential control and no known control bugs. A static shelf/stand object exists as its own saved USD file (grouped, collision-enabled) but is not yet loaded into the same scene as the robot. No dynamic payload object and no coupling mechanism exist yet.
+
+### Next steps (high level)
+1. Bring the shelf into the main robot scene (reference the saved file or transcribe its layout into the script)
+2. Empirically confirm the correct shelf height by driving the robot underneath, extending the piston fully, and reading the contact plate's actual world position, rather than calculating it by hand
+3. Add a dynamic payload object (rigid body + collision) resting on the shelf
+4. Build the phase-one coupling mechanism (rigid joint) once robot, shelf, and payload coexist in one scene
+5. Carried over: piston/ball joint still untested for actual lift motion; phase two (friction-based holding); RL decision layer; `transport.md` / an Isaac-specific component log still proposed, not created — pending confirmation
+
+---
+
+## Session 7 (continued) — NeuroWare (2026-08-10)
+
+### What was done
+- Confirmed there's no boolean/extrude mesh-modeling tooling available in this Isaac Sim install — custom shapes are composed from separate simple primitives instead, which is sufficient for this project's needs (no cutting/CSG required for a shelf or payload)
+- Built a set of payload objects (a cylinder and three cubes) on the shelf using the same hand-in-GUI workflow as the shelf itself, then applied real dynamic rigid-body physics to them via script (collision plus gravity/dynamics, unlike the shelf's static-only treatment), confirmed applied by directly reading the saved file's physics data back
+- Merged the hand-built shelf-and-payload layout into the main project script, replacing its previous from-scratch scene setup (which re-imported the robot fresh every run). The script now opens the saved layout directly, which already contains the robot, and adds the keyboard-driven wheel control on top — robot, shelf, and payload all now load together in one place and one script, confirmed running cleanly with no errors
+
+### What worked
+- The static-vs-dynamic physics split (collision-only for the shelf, collision plus rigid body for the payload) behaved exactly as intended once correctly applied and verified against the saved file's actual data
+- Directly inspecting the saved USD file's real contents (rather than trusting the GUI's apparent state or console output alone) was repeatedly what actually resolved confusion about what had or hadn't been saved
+
+### What did not work
+- Misdiagnosed a live, actively-in-use interactive session as hung — based on an external log file showing no new output for several minutes — and force-killed it. The real cause was output buffering (the log looked silent while the session was actually running fine and being used), not an actual hang; this risked losing whatever unsaved work existed in that session at the time. Root-caused afterward; going forward, output is captured unbuffered so silence in the log can be trusted, and a live interactive session is not force-killed on log silence alone without checking first
+- Repeated confusion between what was saved to disk versus what only existed in the still-open GUI session, leading to at least one wasted round of trying to add physics to objects that, at that exact moment, genuinely weren't in the saved file yet. Resolved each time by re-checking the actual file directly rather than assuming a save had completed
+
+### Current state
+The main project script now opens a hand-built environment (static-collision shelf, four dynamic payload objects) together with the already-embedded, keyboard-drivable robot, confirmed running without errors — the robot can be driven up to the shelf and payload to observe real collision behavior. No coupling mechanism exists yet; this is purely the physical test environment it will be built on top of. The shelf/payload USD file itself lives outside the git repo (not version-controlled) and was built entirely by hand plus one-off physics-fixup scripts, not from a reusable code path.
+
+### Next steps (high level)
+1. Empirically confirm the shelf height/fit is actually correct for the robot's piston reach (still not measured — the current shelf was positioned by eye in the GUI, not validated against the piston's extension range)
+2. Build the phase-one coupling mechanism (rigid joint) now that robot, shelf, and payload coexist in one scene
+3. Test the piston (position control) and ball joint — still untested
+4. Decide whether the hand-built shelf/payload layout should be brought into the repo (e.g. as a tracked asset) for reproducibility, since it currently only exists on disk outside git
+5. Carried over: phase two (friction-based holding); RL decision layer; `transport.md` / an Isaac-specific component log still proposed, not created — pending confirmation
