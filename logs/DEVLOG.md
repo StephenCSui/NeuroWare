@@ -319,3 +319,67 @@ The main project script now opens a hand-built environment (static-collision she
 3. Test the piston (position control) and ball joint — still untested
 4. Decide whether the hand-built shelf/payload layout should be brought into the repo (e.g. as a tracked asset) for reproducibility, since it currently only exists on disk outside git
 5. Carried over: phase two (friction-based holding); RL decision layer; `transport.md` / an Isaac-specific component log still proposed, not created — pending confirmation
+
+---
+
+## Session 8 — NeuroWare (2026-08-11)
+
+### What was done
+- Made the piston hold position under load ("float") instead of just damping, and remapped the F key from piston-down to a one-shot "frame the whole scene" camera action
+- Root-caused and fixed why the platform couldn't reach down far enough to slide under shelf objects — the real fix required editing the robot's physics joint offsets (not the visual mesh), in the shared reference robot asset outside this repo (see note below)
+- Root-caused and fixed a robot turning stall that appeared after an earlier chassis mass increase — a PhysX solver-convergence issue, fixed via articulation solver iteration counts, not by increasing drive torque
+- Added, then fully removed, a set of invisible "riser" objects that were meant to lift payload objects off the shelf surface for clearance — they ended up being the direct cause of the robot's lift mechanism jamming against the shelf, confirmed by the user's own live testing
+- Found and fixed the real cause of "the robot can't pick anything up": the piston's drive force was capped far below what's needed to lift real payload masses. Also found and fixed a second, unrelated cause: a leftover collision proxy on the piston rod (sized for old, pre-fix geometry) was physically colliding with the shelf structure
+- Corrected the robot's spawn position/orientation twice — first to face the shelf at all, then to approach from the shelf's short side rather than its long side, based on the shelf's actual corner-leg geometry rather than assumption
+- Built a new autonomous single-robot pick-up script (`isaac/pickup_demo.py`) — drives straight to a shelf object and lifts it with no steering needed, triggered by pressing P, then hands off to the same manual keyboard controls as the main script
+- Fixed harsh unlit-black shading in the low-VRAM viewport by disabling shadow casting on the scene's directional light and increasing ambient fill lighting
+- At the user's request, simplified the shelf (removed the full-width solid floor panels down to just corner legs and thin rails) and retuned the payload objects' size/mass and the piston's lift-force cap so that 3 of the 4 objects are liftable by one robot and one deliberately is not (requires two robots) — the force value needed was found empirically, not by calculation (see below)
+
+### What worked
+- The float/position-hold piston, the turning fix, and the pick-up sequence were all confirmed via direct headless verification before being shown live, and then confirmed again live by the user
+- Diagnosing collision issues by directly measuring USD collision-geometry bounding boxes (rather than guessing from the visual scene) correctly found both the riser jam and the leftover-collision-proxy jam
+- Removing the shelf's solid floor panels (user's own change, done live in the GUI) left no orphaned collision or dangling references — verified directly afterward
+
+### What did not work
+- Static physics (mass × gravity) badly underestimated the real force needed to lift objects in practice — a value that should have worked by the formula left a 9.8kg object barely able to lift at all. The working force value was found by direct empirical testing (try a value, measure whether the object actually lifts) rather than trusted from calculation. This is worth remembering for any future force/weight tuning in this project — don't trust the static formula alone
+- The robot's first two spawn placements were both wrong for reaching the shelf object — first facing directly away from any clear approach path, then facing the shelf's long side instead of its short side. Both were corrected based on directly measured shelf corner-leg positions once the mistake was pointed out
+
+### Current state
+A single robot can now reliably drive to a shelf object and pick it up on its own (autonomous, P-triggered), with the lift force intentionally capped so 3 of the 4 current payload objects are liftable solo and the heaviest (18kg) is not. No multi-robot coupling or coordination exists yet — this session was entirely about proving one robot's mechanics work correctly, which was the standing precondition from Session 7. The functional fixes to the robot's own joint geometry live in `gitignore/paper_robot_centered_actuator_v6/...` (the shared reference robot asset), which is excluded from git via `.gitignore` — those fixes are not currently version-controlled anywhere.
+
+### Next steps (high level)
+1. Build the phase-one coupling mechanism (rigid joint, single robot to object) — still not started, carried over from Session 7
+2. Use the newly-created 2-robot-required object (18kg) as the first real test case for multi-robot cooperative lift, once coupling exists
+3. Port the validated pygame transport-negotiation design (recruitment, readiness gate, routing) into Isaac Sim — carried over from Session 5, still not begun
+4. RL decision layer still not started — deliberately deferred until the mechanical/coordination layer is proven, per the same lesson learned in the farm project
+5. Decide what to do about the un-version-controlled robot asset fixes (outside git via `.gitignore`) before they're lost or diverge further
+6. `transport.md` / an Isaac-specific component log still proposed, not created — this session in particular had a lot of detailed bug/fix history that belongs in a component log rather than here; pending confirmation
+
+---
+
+## Session 8 (continued) — NeuroWare (2026-08-11)
+
+### What was done
+- Created two new component logs, `logs/isaac_robot.md` and `logs/isaac_environment.md`, splitting robot-mechanics history from shelf/scene history — addresses the "pending confirmation" item from earlier in this session
+- Duplicated the robot and shelf to build a second full setup (`Robot2`, `Shelf2`) in a new scene file (`isaac/test/two_robot_two_shelf.usd`), exported separately so the original single-robot file was left untouched
+- Built a full two-robot cooperative lift-and-carry sequence (`isaac/two_robot_pickup_demo.py`, P-triggered, same convention as the single-robot script): both robots straddle a payload object from opposite ends, lift it together, turn to face a delivery direction, and drive it to a second shelf
+- Diagnosed and fixed a chain of issues that each masked the next one: the two robots colliding with each other while turning (fixed by increasing the payload object's length for more clearance, and by staggering the turns instead of doing them simultaneously), the carried object falling off during the drive (traced to an instant full-speed command from a standstill, not gradual drift as first suspected — fixed with a speed ramp), the plate tilting/not holding orientation under load (the ball-joint roll/pitch/yaw drives were damping-only, fixed with real position control), and a final-position bug that looked like a physics problem but was a plain control-logic bug (a symmetric stop-distance check that systematically undershot the target — see the `isaac_robot.md` component log for the exact mechanism)
+- Along the way, also fixed a real stdout-buffering bug that was silently hiding the script's own diagnostic print output from the redirected log file
+
+### What worked
+- The full two-robot sequence now runs correctly end to end: pickup, synchronized lift, staggered exact-angle turn, straight-line drive, arriving within centimeters of the intended target — confirmed via the script's own logged world-coordinate output, not just visual inspection
+- Turning to an exact, analytically-known angle and then driving with zero steering correction was far more reliable than continuously correcting steering toward a live bearing calculation — small residual heading error under continuous correction was enough to make two robots drift out of sync with each other
+- Getting precise, printed ground-truth numbers (object mass, shelf gap coordinates, final robot/plate positions) repeatedly resolved disagreements that screenshots and visual inspection alone could not
+
+### What did not work
+- Several early hypotheses were wrong and cost real time before being corrected: assumed the object-falling problem was gradual path divergence (it was an instant-speed jolt), assumed a "wrong stopping location" was downstream of the missing rigid-coupling mechanism (it was an unrelated, plain control-logic bug), and briefly misjudged a coordinate discrepancy as a possible bug before realizing it was a local-vs-world reference frame mismatch
+- A `replace_all` text edit meant to fix one joint's force value accidentally corrupted a different joint's already-correct value via an unintended substring match — caught and fixed, but worth remembering as a real risk of blind `replace_all` on numeric values
+
+### Current state
+Two robots can now reliably cooperate to lift an object too heavy for either one alone, turn together, and carry it to a second shelf, landing within centimeters of the intended spot with the object still on the plates the whole way — confirmed via direct logged coordinates, not just visual inspection. No rigid coupling mechanism was needed to achieve this; careful motion control (exact-angle turns, zero-correction straight driving, speed ramping, tight tolerances) was sufficient for this specific pickup→turn→carry→arrive case. Whether that holds for more complex routes (turning mid-path, obstacles) is untested.
+
+### Next steps (high level)
+1. Test whether the current motion-control-only approach holds up for more complex delivery paths, or whether the rigid coupling mechanism (still not built) becomes necessary once routes aren't a single clean turn-then-straight-line
+2. Decide whether to unload/place the object at the destination (current sequence stops with it still lifted on the plates — no lower/release step exists yet)
+3. Live-obstacle reaction (user can place something in the robots' path mid-run and have them re-route) — explicitly deferred until after two-robot coordination was working, which it now is
+4. Carried over: phase-two friction-based holding; port the pygame transport-negotiation design; RL decision layer; decide what to do about the un-version-controlled robot asset fixes

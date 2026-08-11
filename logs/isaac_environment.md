@@ -1,0 +1,42 @@
+# Isaac Sim Environment — Component Log
+
+Detailed history of the shelf/scene/world-layout side of the Isaac Sim project: `isaac/test/shelves1_with_collision.usd` and `isaac/test/two_robot_two_shelf.usd`, the hand-built shelf structure, payload objects, and world coordinate layout. Robot mechanics/control history is in `isaac_robot.md`.
+
+---
+
+## Session 8 — NeuroWare (2026-08-11)
+
+### Current state
+`shelves1_with_collision.usd`: one shelf (3 tiers, corner legs + thin rails only, solid front/back panels removed), 4 payload objects, single robot. `two_robot_two_shelf.usd`: a second shelf (`Shelf2`, duplicated + shifted) and second robot (`Robot2`) added on top of that, used for the two-robot cooperative-carry work. Both files verified loading and settling cleanly.
+
+### What was done
+- **Invisible riser objects — added, then fully removed**: initially added small invisible static boxes under each payload object (5cm clearance) so the robot's platform could slide underneath. These turned out to be the direct cause of a later collision jam (the platform's rod colliding with the riser's own collision volume) and were fully removed at the user's request once a different fix (see `isaac_robot.md`'s collision-cylinder fix) made them unnecessary.
+- **Shelf panel removal**: the user manually deleted the 6 full-width, 10cm-thick solid floor panels (front/back panel per tier — `Cube`, `Cube_02`, `Cube_08`, `Cube_11`, `Cube_12`, `Cube_15`) directly in the GUI, leaving only the thin lip/rail pieces and 4 corner legs per tier. Verified afterward: no orphaned collision, no dangling `FilteredPairsAPI` relationships pointing at the deleted prims.
+- **Shelf gap discovery**: each tier's remaining rail layout has a genuine ~0.1m-wide **construction gap with no floor material at all** (`y[3.2,3.3]` on shelf 2, `y[-0.8,-0.7]` on shelf 1 pre-shift) between the "lip" rail and "mid-rail" piece. This is real hand-built-scene geometry, not a bug — and became load-bearing for the whole two-robot approach (the robots' pickup/delivery Y is deliberately centered on this gap so nothing needs to clear a solid panel vertically).
+- **Payload object retuning** (`Cube_01`, later the "needs 2 robots" test object): resized multiple times to balance two goals — enough physical separation between two robots picking it up from either end (to avoid a chassis collision while turning), and a target mass in the "too heavy for 1 robot (200N cap), liftable by 2" range.
+  - Height/depth trimmed first for an unrelated mass target (`0.06` height, `0.28` depth after a couple of iterations), landing around 18kg.
+  - Length increased 0.6m → 1.0m → 0.8m specifically for robot-to-robot clearance during the two-robot pickup (0.6m nose-to-nose gave only ~0.09m of chassis clearance, which rammed the two robots together during a simultaneous turn). 1.0m clipped a shelf corner leg; 0.8m was the value that both cleared the leg and gave workable clearance.
+  - Final dimensions: 0.8 (L) × 0.28 (D) × 0.06 (H) → **13.44kg** (mass = L×D×H×1000, density 1000 kg/m³, not independently authored — confirmed by resolved-mass computation matching the volume formula exactly at every size tested).
+  - Mass note: since mass isn't independently set, changing any one dimension moves mass too — this was flagged live each time (e.g. lengthening for clearance also raised mass, which then needed depth/height trimmed back down).
+- **Two-robot/two-shelf scene built** (`two_robot_two_shelf.usd`, exported from `shelves1_with_collision.usd` via `Sdf.CopySpec`, not overwriting the source file):
+  - `Robot2`: deep-copied from `Robot`'s prim spec (carries the same external-asset reference, giving a second independent instance of the same robot).
+  - `Shelf2`: deep-copied from `Shelf`'s local prim tree (no external reference, so a straight `Sdf.CopySpec`), then given its own `xformOp:translate=(0,4,0)` to shift it away from shelf 1.
+  - Payload objects were **not** duplicated onto shelf 2 — it starts empty, since the point is delivering an object there.
+- **World coordinate frame confusion, resolved**: `Robot`/`Robot2`'s own Xform retains a static spawn-position offset (`translate.y=-0.747` for both). `base_link` (and everything under it) is a child of that Xform, so Isaac Sim's Property panel shows `base_link`'s pose **local** to that parent, not true world position. `local_y = world_y + 0.747`. Caused real confusion mid-session (a world-Y of 3.25 reads as ~4.0 in the panel) before being pinned down by directly comparing `Shelf2`'s own Translate value (`Y=4.0`, the shift amount) against its actual measured geometric center (`Y=3.25`, since the copied child geometry itself carries a baked-in -0.75 offset from how shelf 1 was originally hand-placed). **Rule of thumb going forward: always compute/report world-frame coordinates via `get_world_poses()`, and if comparing to what's shown in the GUI Property panel, expect a `+0.747`-ish offset for anything under Robot/Robot2, and expect any Xform-group's own Translate value to differ from its child geometry's true center by whatever offset was originally baked into that geometry.**
+
+### What worked
+- `Sdf.CopySpec` cleanly duplicates both referenced prims (`Robot`, carrying its external-asset reference along) and locally-authored prim trees (`Shelf`, no references) within the same layer — confirmed via headless settle-and-verify each time.
+- Exporting to a new file (`stage.GetRootLayer().Export(new_path)`) rather than saving in place reliably kept `shelves1_with_collision.usd` untouched while building `two_robot_two_shelf.usd` on top of it.
+- Directly measuring collision-geometry bounding boxes (rather than reasoning from memory or screenshots) was the only reliable way to resolve the shelf-gap-location and world/local-coordinate confusions — both times a guess based on "should be" reasoning was wrong.
+
+### What did not work
+- Assuming a duplicated Xform-group's own Translate value directly tells you its geometric center — it doesn't, if the child geometry itself carries a baked-in local offset from how it was originally authored (which both shelf copies do, from the original hand-built scene).
+- Diagnosing "why did it stop in the wrong place" from screenshots and visual impressions alone, more than once — wide-lens camera angles at this small scale made height/position differences visually misleading. Only got a real answer once actual printed world coordinates were captured from the running script.
+
+### Dependencies
+- `two_robot_two_shelf.usd` was exported from `shelves1_with_collision.usd` at a specific point in time — any *later* changes to `shelves1_with_collision.usd` (e.g. further shelf-1 edits) will **not** propagate to `two_robot_two_shelf.usd` automatically, since it's an independent exported copy, not a reference.
+- Robot spawn positions/orientations for both files are hand-set world-space values in the script/file directly (not computed from shelf geometry at runtime) — if shelf geometry changes again, these will need re-deriving.
+
+### [WORTH EXPLORING]
+- Shelf 2 currently has no payload objects and no defined "destination slot" structure — it's just an empty duplicate shelf. If multi-object reorganization (moving several objects between shelves) becomes the active work, this will need real slot-tracking, not just an empty target.
+- The gap-in-the-rail-layout that both shelves' pickup/delivery points rely on is a side effect of the original hand-built geometry, not a designed feature — worth deciding whether to formalize it (e.g. explicitly document/measure it as "the access gap" for every tier) or redesign the shelf with an intentional access point once shelf design work resumes.

@@ -18,6 +18,8 @@ The primary reader of every log entry is **an AI assistant at the start of a fut
 | `logs/agent.md` | Detailed history of `agent.py` across sessions. |
 | `logs/captain.md` | Detailed history of `captain.py` across sessions. |
 | `logs/environment.md` | Detailed history of `config.py`, `item.py`, `zone.py`, `main.py` — the simulation environment. |
+| `logs/isaac_robot.md` | Detailed history of the Isaac Sim reference robot's joint geometry, physics tuning, and drive/lift/turn control code. |
+| `logs/isaac_environment.md` | Detailed history of the Isaac Sim shelf/scene/world layout — hand-built shelf structure, payload objects, world coordinate frame. |
 
 Additional component logs may be created when a component grows complex enough to warrant one. Ask the user before creating a new log file.
 
