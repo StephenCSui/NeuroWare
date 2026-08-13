@@ -40,3 +40,45 @@ Detailed history of the shelf/scene/world-layout side of the Isaac Sim project: 
 ### [WORTH EXPLORING]
 - Shelf 2 currently has no payload objects and no defined "destination slot" structure — it's just an empty duplicate shelf. If multi-object reorganization (moving several objects between shelves) becomes the active work, this will need real slot-tracking, not just an empty target.
 - The gap-in-the-rail-layout that both shelves' pickup/delivery points rely on is a side effect of the original hand-built geometry, not a designed feature — worth deciding whether to formalize it (e.g. explicitly document/measure it as "the access gap" for every tier) or redesign the shelf with an intentional access point once shelf design work resumes.
+
+---
+
+## Session 9 — NeuroWare (2026-08-12)
+
+### Current state
+All 4 shelf-1 payload objects now have confirmed real masses/positions (queried directly from the running scene, not assumed) and are all actively used by the multi-object delivery routine. A stray manually-created test object (`/Cube_03`) is sitting in `two_robot_two_shelf.usd` itself, not part of the intended scene — pending user decision on removal.
+
+### What was done
+- **Real payload data queried directly** from `two_robot_two_shelf.usd` before designing the multi-object delivery task split (previous sessions only had confirmed numbers for `Cube` and `Cube_01`):
+
+  | Object | Mass | World X (shelf-1 row) | Solo-liftable? |
+  |---|---|---|---|
+  | Cube_02 | 2.0 kg | 0.162 | yes |
+  | Cylinder | 7.07 kg | 0.531 | yes |
+  | Cube | 9.8 kg | 0.836 | yes (tuned to the solo-lift ceiling in Session 8) |
+  | Cube_01 | 13.44 kg | -0.509 | no — needs both robots |
+
+  Confirmed by directly playing physics for a few ticks and reading `RigidPrim.get_masses()` / `get_world_poses()`, not computed from scale values alone this time (though the resolved masses do match the established `L×W×H×1000` density formula from Session 8).
+- **Delivery placement convention established**: each solo object is delivered to shelf 2 at the same X it had on shelf 1 (only Y changes, to `DELIVERY_Y=3.25`) — the original shelf-1 spacing between all 4 objects was already collision-free, so mirroring it onto shelf 2 avoids having to work out new drop slots from scratch.
+- **Found a stray object baked into the scene file**: `/Cube_03`, a top-level `Mesh` prim (not one of the four known payload objects, and not under `/World/Shelf`'s structural rail hierarchy either), sitting at world position roughly (0.72, 1.33, 0.57) — directly in the open corridor between shelf 1 and shelf 2 that every carry leg drives through. Has no `PhysicsCollisionAPI` (`collision=False`). Confirmed present in the actual file on disk (not just a runtime artifact) by opening `two_robot_two_shelf.usd` fresh and checking `stage.GetPrimAtPath('/Cube_03')` directly — it exists, with real authored `xformOp:translate`. The file's mtime lines up with a live GUI session earlier in this session, and Isaac Sim's GUI auto-names newly created Cube primitives sequentially (`/Cube`, `/Cube_01`, `/Cube_02` already existed at the time, so a new one becomes `/Cube_03`) — near-certain this is a cube the user created by hand in the GUI while live-testing an obstacle, which then got auto-saved into the shared file rather than staying session-local.
+- This explains a run of confusing results in `isaac_robot.md`'s Session 9 entry: a "clean" headless obstacle-detour test (no obstacle placed by anyone) still detected something at the same spot, every single time, because the scene it was opening was never actually clean — `/Cube_03` was already there.
+
+### What worked
+- Directly querying `stage.GetPrimAtPath(...)` against the actual file on disk (not the live in-memory session) was what finally settled whether `/Cube_03` was a real, persisted part of the scene or just something transient — same "check the actual saved file, don't trust the live session's apparent state" lesson from Session 7, recurring in a new form.
+
+### What did not work
+- Assuming a "clean" scene load meant a clean scene, without checking — cost a full round of misdiagnosis (chased a self-occlusion camera-geometry hypothesis) before the stray object was found. The scene file is not, in fact, guaranteed clean just because no obstacle was intentionally placed for a given test run.
+
+### Key decisions
+- Real object masses/positions are queried live from the running scene for any future task design in this file, not computed or assumed from stored scale values — this was already the established convention (Session 8) but is now the basis for an actual multi-object task split, not just a single-object sanity check.
+
+### Dependencies
+- `two_robot_pickup_demo.py`'s `run_full_delivery()` (see `isaac_robot.md`) directly depends on the 4 masses/positions recorded above being accurate for its solo-vs-duo task assignment. If shelf-1 payload objects are ever resized or repositioned again, that assignment needs re-deriving, not assumed to still hold.
+- `two_robot_two_shelf.usd` currently contains `/Cube_03`, an unintended manually-created object with no corresponding entry in any script. Any future "fresh scene" assumption for this file is not actually safe until this is either removed or explicitly accounted for.
+
+### [POTENTIAL FIX]
+- Remove `/Cube_03` from `two_robot_two_shelf.usd` to restore a genuinely clean baseline scene — proposed to the user, not yet actioned as of this session's end.
+- Going forward, obstacle testing should use the scripted `spawn_obstacle()` keybind (`O`/`I`, see `isaac_robot.md`) instead of manually creating geometry in the GUI during a live session on this shared file, specifically to avoid a repeat of this exact issue.
+
+### [WORTH EXPLORING]
+- No general safeguard exists against a live GUI session silently persisting ad-hoc changes into a shared scene file that scripts assume is a clean, known-good baseline. Worth considering whether test/demo scene files should be opened read-only, or from a scratch copy, during any live session where manual GUI edits might happen.

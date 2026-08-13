@@ -383,3 +383,125 @@ Two robots can now reliably cooperate to lift an object too heavy for either one
 2. Decide whether to unload/place the object at the destination (current sequence stops with it still lifted on the plates — no lower/release step exists yet)
 3. Live-obstacle reaction (user can place something in the robots' path mid-run and have them re-route) — explicitly deferred until after two-robot coordination was working, which it now is
 4. Carried over: phase-two friction-based holding; port the pygame transport-negotiation design; RL decision layer; decide what to do about the un-version-controlled robot asset fixes
+
+---
+
+## Session 9 — NeuroWare (2026-08-12)
+
+### What was done
+- Added the lower/unload step to the two-robot cooperative sequence (it previously ended with the object still lifted on the plates)
+- Generalized navigation from a single hardcoded shelf1->shelf2 route to arbitrary point-to-point travel (turn-to-bearing then straight-line), and used it to build a full 4-object delivery run: the three lighter payload objects are each carried solo by whichever robot is nearer, the heaviest cooperatively by both, with each robot working through its own object list and only converging for the shared lift
+- Found and fixed two real navigation bugs via headless testing before they ever reached live testing: a turn step-budget too small for large turns between arbitrary objects, and a stop-condition that checked raw distance-to-target (which can climb again after a near-miss) instead of forward progress along the actual heading — the fix is a direct generalization of a stop-condition bug fixed last session
+- Added a real depth camera per robot for obstacle sensing, fixing three separate bugs along the way before it produced valid data: a wrong assumption about the camera class's local-orientation convention, a default near-clip plane that hid everything within 1m (too far for this small robot), and an initial field of view too narrow to be useful
+- Added a simple reactive obstacle-avoidance ("detour") behavior on carry legs only (not pickup-approach legs, where the target itself would trip the check): stop if something's too close ahead, turn toward whichever side the depth sensor shows more room, hop, and retry. Deliberately scoped as a reflex, not real path planning, per explicit discussion with the user
+- Built live diagnostic tooling in response to a real, hard-to-diagnose live failure: periodic position/rotation tracing for both robots and every payload object, and a PhysX raycast that identifies exactly which prim is triggering an obstacle stop instead of guessing from geometry on paper
+
+### What worked
+- Headless testing before live testing continued to pay off — every navigation and camera bug this session was caught and fixed without needing the live GUI first
+- Direct, ground-truth diagnostics (querying real object masses/positions from the running scene, raycasting to identify exactly what a sensor is detecting) repeatedly resolved things that looked ambiguous or contradictory from reasoning or screenshots alone — most notably a live "false obstacle" that turned out to be a leftover test object, not a sensing bug
+
+### What did not work
+- Two early camera-orientation assumptions were wrong and cost real iteration: a hand-derived look-at quaternion assumed the wrong forward-axis convention, and a hand-rolled quaternion-from-rotation-matrix formula produced NaN for a near-180-degree case that a standard library implementation handled correctly on the first try
+- The obstacle-avoidance reflex, as first built, does not reliably work against a real obstacle in live testing: a single fixed-direction turn and short hop was not enough clearance, and there was no recovery once the robot was genuinely stuck against it — confirmed directly from logs, not yet fixed. A same-direction-every-time turn choice was also confirmed to be part of the problem and has since been replaced with a depth-comparison-based direction choice, but the clearance/stuck-recovery issue itself is still open
+- A cube manually created in the Isaac Sim GUI during live testing got silently auto-saved into the shared scene file (`two_robot_two_shelf.usd`), which made several subsequent "clean" test runs misleading — they kept reporting an obstacle that looked like a new bug but was actually the same leftover object every time. Traced down via the raycast tooling built this session, not yet removed from the file
+
+### Current state
+The two-robot demo delivers all 4 shelf-1 payload objects to shelf 2 (3 solo, 1 cooperative) with real depth sensing and a direction-aware reactive obstacle-avoidance reflex, but that reflex has a confirmed real-world failure mode — it can get stuck against a real obstacle with no recovery — that is not yet fixed. A stray manually-created test object is still sitting in the shared scene file, pending the user's decision on whether to remove it.
+
+### Next steps (high level)
+1. Fix the obstacle-avoidance recovery failure (more clearance per hop, and/or real stall detection with an escape maneuver) — direct next step
+2. Remove or keep the stray leftover test object in the scene file, per user decision
+3. Parallelize the solo-object pickups so both robots move at once instead of one at a time — explicitly raised and deferred earlier this session
+4. Carried over: phase-two friction-based holding; port the pygame transport-negotiation design; RL decision layer; decide what to do about the un-version-controlled robot asset fixes
+
+---
+
+## Session 10 — NeuroWare (2026-08-13)
+
+### What was done
+- Replaced last session's reactive fixed-angle/fixed-distance obstacle detour with real path planning: a new `isaac/occupancy_grid.py` module (live 2D occupancy grid, ray-marched from each robot's depth camera every tick, plus 8-connected A* with line-of-sight path simplification), wired into carry legs so every turn/drive distance comes from an actual planned route instead of a constant. Unit-tested standalone (gap-passing, fully-blocked, moving-obstacle re-scan) before wiring in
+- Added ground-truth cargo tracking (`check_cargo`, not sensor-based): compares each carried object's real simulated height against its lifted height every tick, so a dropped payload is caught and reported honestly instead of being misread as a new obstacle by the depth sensor — this is what had been happening: a carried object knocked loose during an old-style detour turn was later "detected" as a phantom obstacle
+- Root-caused a real, reproducible physical stall via direct wheel-velocity diagnostics (not guessing): right after a lift near shelf 1, a waypoint turn can rotate the chassis while it's still within the shelf's corner-leg clearance, and a wheel physically scrapes against a corner leg the forward-only depth camera never sees (off to the side, not ahead) — confirmed live: wheels spinning with real, non-zero velocity but producing zero net chassis rotation
+- Iterated a reactive "clear rotation space before turning" fix through three versions (fixed hop → locked escape direction → centroid-of-nearby-occupied-cells direction) — each fixed a real bug the previous version had, but the underlying reflex-based approach kept being unreliable; concluded a proper fix needs "get clear" to be a real planned A* leg (to the nearest rotation-safe cell) rather than a bolted-on reflex with no route awareness. Not yet implemented
+- Evaluated switching to an RTX Lidar sensor for 360-degree coverage (the actual root cause above is a single forward-facing camera's blind spot) and decided against it: measured real VRAM cost via headless smoke tests (`isaac/smoke_test_lidar.py`) at ~280MB per lidar vs ~77MB per depth camera — not because of scan range, but because the lidar's `GenericModelOutput` data format is genuinely richer (~452k points/frame at ~43 bytes/point, vs the camera's 16k pixels at 4 bytes/pixel) than this project's obstacle-avoidance use case needs
+- Decided on 4 depth cameras per robot (one per corner) instead of lidar or a 2-camera diagonal pair, since adding more depth cameras was already confirmed cheap earlier in the project (6 simultaneous cameras cost barely more than 1 — most of the VRAM cost is a one-time shared render-pipeline setup, not a true per-camera cost)
+
+### What worked
+- Headless-first testing continued to catch every real bug before live testing, including the turn-freeze introduced by a speed-decel-ramp addition (confirmed via direct evidence: identical yaw reading across the entire remaining step budget)
+- Direct instrumentation at the exact moment of a failure (wheel DOF velocities, raycast, position, all captured together) is what actually found the real physical cause of the shelf-corner stall — reasoning about it from grid images and position alone had led to a wrong conclusion (`/Cube_03`, the old leftover stray object) before the wheel-velocity data ruled it out
+
+### What did not work
+- Assumed a lidar would be cheaper than a depth camera because it skips the rasterized render pipeline — wrong. It still creates its own render product internally, and its per-frame data format is far richer than assumed; confirmed empirically rather than left as a guess once the numbers didn't add up
+- Three consecutive attempts at a reactive "back away from what's blocking me" fix each solved the previous version's specific bug (oscillating direction, then sliding sideways along an extended obstacle) without reliably solving the actual problem — a sign the reflex-based shape of the fix was wrong, not just its tuning
+
+### Current state
+Real path planning (live occupancy grid + A*) is built and works correctly for legs that don't start with the robot already wedged against shelf structure. The specific failure mode — rotating right after a lift while still within a shelf's corner-leg clearance — is root-caused with hard evidence (wheel velocity, position, raycast) but not yet fixed; three reflex-based attempts were superseded by a decision to fix it via planning instead. Lidar was evaluated and rejected in favor of a 4-camera-per-robot (one per corner) sensing layout, not yet implemented.
+
+### Next steps (high level)
+1. Implement 4 depth cameras per robot, one at each corner, feeding the same shared occupancy grid
+2. Implement the planned (not reactive) fix for "get clear enough to rotate": a real A* leg to the nearest rotation-safe cell
+3. Re-verify headless, then live, per the established pattern
+4. Carried over: phase-two friction-based holding; port the pygame transport-negotiation design; RL decision layer; decide what to do about the un-version-controlled robot asset fixes; remove or keep the stray `/Cube_03` object (still pending)
+
+---
+
+## Session 11 — NeuroWare (2026-08-13)
+
+### What was done
+- Implemented the 4-corner-camera layout and the planned (not reactive) minimal-displacement recovery from last session's next-steps list: `occupancy_grid.py` now inflates by a real rotation-swept radius (chassis + whatever's being carried) instead of a flat constant, and `plan_to_clear` replaces the old reflex-based "back off" with a real Dijkstra search to the nearest genuinely clear cell
+- Built a live 2D visualizer (`isaac/visualize_2d.py`, standalone `pygame` process, polls a small state file the main script writes every few ticks) to watch the planner's grid/path live instead of guessing from behavior
+- Root-caused, via direct headless wheel-velocity instrumentation, two separate real bugs behind "the robot randomly refuses to turn":
+  1. The plate's active yaw-compensation joint (which counter-rotates the plate against the chassis so it holds a fixed world orientation while turning) was fighting the wheel drives hard enough to genuinely destabilize wheel-velocity tracking during a turn — confirmed in a fully isolated empty scene with no cargo, no obstacles. Lowering the joint's gains did not help (reproduced at every gain level tested, down to zero). Fixed by disabling that joint's drive entirely for the duration of any turn (it holds its orientation passively via its own inertia instead) and re-enabling it once the turn finishes.
+  2. Even with that fixed, real carry turns (with actual cargo on the plate) still stalled consistently at almost exactly the same yaw error every time, regardless of cargo weight or nearby obstacles. Traced to the turn's deceleration ramp: below roughly 2 rad/s commanded wheel speed, the wheel drive genuinely stops tracking its own velocity target (confirmed via direct `get_dof_velocities` readback showing wrong-signed, multiples-of-target wheel speeds). Fixed by raising the ramp's minimum speed floor (`MIN_RAMP_OUT`) from 0.15 to 0.6 — high enough to stay clear of the unstable zone while still giving a real deceleration ramp, not just disabling it.
+- Along the way, tested and ruled out two other hypotheses for the same stalls before finding the real cause above: the robot seeing its own carried cargo as a phantom obstacle (checked cameras + occupancy grid directly at the exact failure point — both clean, nothing within 0.5-0.6m of the robot), and the cargo simply being too heavy (re-ran the identical failing turn with cargo mass cut from 9.8kg to 0.05kg — failed almost identically)
+- Added a structured per-task diagnostic to `run_turn`: every rotation now logs a start (target, tick) and an end with a concrete pass/fail reason (reached tolerance / stalled — wheels not tracking / timed out — still N degrees short), plus the max wheel-tracking error observed, instead of only a scattered stall dump
+- Simplified both shelf scenes (`two_robot_two_shelf.usd` and `shelves1_with_collision.usd`) from 3 tiers down to 1, per direct request — this turned out to be unrelated to the turning-stall bug (confirmed the exact same stall still happened with every shelf corner leg physically removed from the scene) but is kept as the intended simplification regardless
+
+### What worked
+- Isolating the wheel-instability bug in a genuinely bare scene (one robot, ground plane, nothing else) was what made it possible to pin down at all — reproducing it against the real multi-shelf scene first would have left shelf-leg collisions, cargo dynamics, and the real bug all tangled together
+- Testing each hypothesis by directly removing the suspected cause (legs, self-detection, cargo weight) rather than reasoning about it kept the investigation from settling on a plausible-looking but wrong explanation more than once
+
+### What did not work
+- The first fix attempt (lowering the yaw-compensation joint's gains) did not work at all — the instability was present at every gain level tried, including zero, which is what redirected the fix toward disabling the joint during turns instead of tuning it
+- Shelf simplification, while a legitimate change on its own, did not fix the stall it was hoped might help with — the actual blocker (at the time) was a real leg the robot's cargo was genuinely touching, confirmed by raycast, and unrelated to tier count
+
+### Current state
+The two real bugs behind "the robot won't turn" are both fixed and verified: a from-scratch headless run of the real (not monkey-patched) script now completes the carry turn cleanly (0.009° final error, well inside tolerance) where it previously stalled every time. Running against the full shelf scene (legs present), the same leg-clearance issue from earlier sessions is still there — now confirmed as a genuine, real collision (raycast-verified) rather than a red herring — so a full pickup-carry-lower cycle still doesn't complete end to end yet. A separate, likely unrelated obstacle-detection false trip (an 0.36m distance reading with no raycast hit behind it, right at the current footprint threshold, probably the floor at a grazing camera angle) also showed up during a carry drive and is not yet investigated.
+
+### Next steps (high level)
+1. Fix the real shelf-corner-leg clearance issue now that the wheel bugs masking it are gone — likely needs the occupancy grid to actually account for leg geometry during planning, not just react to it
+2. Investigate the floor-grazing false-positive obstacle-distance reading during drives
+3. Re-run the full multi-object delivery end to end, live, once the above are resolved
+4. Carried over: phase-two friction-based holding; port the pygame transport-negotiation design; RL decision layer; decide what to do about the un-version-controlled robot asset fixes; remove or keep the stray `/Cube_03` object (still pending)
+
+---
+
+## Session 12 — NeuroWare (2026-08-13)
+
+### What was done
+- Root-caused the actual reason the old hand-rolled planner kept re-detouring into the same obstacle: the occupancy grid was globally searched (A*) correctly, but real-time reactive detections (the close-range camera stop) were never written back into the grid, so the next replan had no memory of what had just been seen and picked the same doomed path again. Fixed with `occupancy_grid.mark_detected_obstacle()`, wired into the reactive stop in `robot1_cube03_live_test.py` (mirrored into `two_robot_pickup_demo.py`, not independently re-verified this session per explicit instruction to focus on the USD in active use). Also fixed a `run_goto` recovery bug conflating "genuinely stuck" (`plan_to_clear` returns `None`) with "already clear, just retry" (`plan_to_clear` returns a length-1 list) — previously treated identically as failure.
+- Evaluated adopting Nav2 instead of continuing to harden the hand-rolled planner (prompted by repeated live failures) and got explicit go-ahead to migrate. Confirmed ROS2 Humble already installed on the system before starting.
+- Attempted the standard rclpy-in-process approach first and hit a **genuine segfault**, not just an import error — root-caused via crash-dump log analysis (not guessed) to a Python 3.10-vs-3.12 C-extension ABI mismatch: Isaac Sim 6.0's Kit runs Python 3.12, but both system ROS2 Humble's rclpy *and* Isaac's own bundled "internal rclpy for humble" are built against Python 3.10, and crash identically once a real ROS2 message is constructed (`PyUnicode_IS_READY` assertion — a macro Python 3.12 removed as a real check, so its presence as a failing assertion proves a Python-3.10-era binary). This is a fundamental binary incompatibility, not fixable via env vars.
+- Pivoted to Isaac's native OmniGraph ROS2 bridge nodes instead (C++, own DDS bindings, never touches the broken rclpy boundary) — confirmed as the right call directly by the user. Built `isaac/nav2_bridge_robot1.py`: odom/TF/cmd_vel via `IsaacComputeOdometry`/`ROS2PublishOdometry`/`ROS2PublishRawTransformTree`/`ROS2SubscribeTwist`, wheel drive split across 4 `IsaacArticulationController` nodes (this robot has 4 wheels, `DifferentialController` only outputs a fixed 2-element command) fed via `ConstructArray`/`ArrayIndex`, a synthesized 360° LaserScan reusing the existing 4-corner depth cameras (no lidar sensor needed — `ROS2PublishLaserScan`'s `linearDepthData` input is fully decoupled from an actual lidar object), and `ROS2PublishClock` for `use_sim_time`. Every node type and attribute name was confirmed against Isaac's own installed `.ogn` definitions and test suite, not guessed.
+- Verified odom, TF, cmd_vel, scan, and clock were all real and live via direct `ros2 topic echo`/`list`, not assumed.
+- Wrote `isaac/nav2_params_robot1.yaml`, adapted directly from the real installed `nav2_bringup` params: dropped AMCL/map_server (ground-truth odom stands in for a map), `global_frame: odom` everywhere, rolling-window costmaps, real robot radius/speed values (not turtlebot3 defaults), tightened goal tolerances per the project's small-scale convention. Fixed a real `inflation_radius` startup warning by raising it to clear the computed inscribed radius.
+- Launched `nav2_bringup navigation_launch.py` against the new params and drove a real goal end to end: confirmed via `ros2 topic pub /goal_pose` and direct `/odom`/`cmd_vel_nav` inspection that `controller_server` was actively planning and commanding real wheel motion, not idle.
+- During live user verification, found and fixed a real bug in the new goal-marker visualization helper (`spawn_marker_at_odom_goal`): it converted an odom-frame goal to a world position with a plain translation, but this robot spawns yawed 180° (confirmed in the stage's Property panel), so the offset needed rotating by the spawn yaw first. Unrotated, the marker landed ~3.9m from the true goal — confirmed directly against real coordinates the user read out of the stage (marker `(0.594, 2.142)` vs. actual `base_link` `(-2.6, 4.37)`). Fixed by rotating the odom-frame offset by `chassis_yaw0` before adding it to the spawn world position, then relaunched the bridge and resent the goal. The actual Nav2 goal itself was very likely unaffected by this bug (it's consumed entirely inside the self-consistent odom→TF pipeline, not through this helper) — moderate confidence, not independently re-derived from Isaac's odometry source.
+
+### What worked
+- Reading real crash-dump logs to root-cause the rclpy segfault, rather than treating it as an unlucky one-off, is what turned a dead end into a confident, correct architectural pivot (OmniGraph) instead of more time spent fighting an unfixable binary mismatch.
+- Verifying every ROS2 topic directly via CLI at each integration step (odom, TF, cmd_vel, scan, clock) caught nothing wrong at that layer — the actual bug that showed up during live verification was isolated entirely to the new Python-side visualization helper, not the ROS2/Nav2 pipeline itself, and the step-by-step verification is what made that isolation possible.
+- Cross-referencing Isaac's own `.ogn` definitions and test suite for exact node/attribute names avoided any guessed OmniGraph wiring.
+
+### What did not work
+- Assuming the standard rclpy approach would work in-process just because Isaac Sim bundles its own "internal rclpy for humble" — it crashes identically to the system install, for the same underlying reason.
+- The first version of the goal-marker helper — didn't account for a non-zero spawn yaw when converting an odom-frame offset to world coordinates, causing a real, user-caught ~3.9m placement error.
+
+### Current state
+Full Nav2 integration is built and live-verified up through active navigation (real odom/TF/cmd_vel/scan/clock, real controller activity responding to a sent goal). The goal-marker visualization bug is fixed and the bridge was relaunched with the correction; the corrected run's actual arrival at the goal was not yet observed before the session ended. The hand-rolled occupancy-grid planner's reactive-detection bug is also fixed and wired into the currently-active USD's live script; the mirror in `two_robot_pickup_demo.py` has the same edit applied but not independently re-verified.
+
+### Next steps (high level)
+1. Re-verify the corrected marker run end to end (does the robot actually reach the goal, tracked live)
+2. Investigate the user's "needs a play button" comment from this session's end — likely wants an easier start/stop/pause affordance for the bridge+Nav2+goal workflow rather than manual multi-terminal relaunching each time; not yet scoped
+3. Re-sync `two_robot_pickup_demo.py`'s mirrored occupancy-grid fixes and independently re-verify them
+4. Carried over: the real shelf-corner-leg clearance issue, the floor-grazing false-positive obstacle reading, phase-two friction-based holding, the pygame transport-negotiation port, RL decision layer, un-version-controlled robot asset fixes, the stray `/Cube_03` object
