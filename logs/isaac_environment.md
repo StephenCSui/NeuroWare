@@ -82,3 +82,71 @@ All 4 shelf-1 payload objects now have confirmed real masses/positions (queried 
 
 ### [WORTH EXPLORING]
 - No general safeguard exists against a live GUI session silently persisting ad-hoc changes into a shared scene file that scripts assume is a clean, known-good baseline. Worth considering whether test/demo scene files should be opened read-only, or from a scratch copy, during any live session where manual GUI edits might happen.
+
+---
+
+## Session 15 — NeuroWare (2026-08-14)
+
+### Current state
+Full ground-truth geometry for `two_robot_two_shelf.usd`'s shelf structure and shelf-1 payload objects independently queried and recorded below (headless `pxr` query against the live file, not derived from prior log narrative). A real, confirmed bug found the same way: the root-level `/Cube_03` obstacle prim has no physics collision in this scene.
+
+### What was done
+- Queried real size/mass/position for all 4 shelf-1 payload objects directly from the running scene (mass read via `RigidPrim.get_masses()` after a few physics ticks, not computed/assumed):
+
+  | Object | Size L×W×H (m) | Mass | World pos (x,y,z) | Solo-liftable? |
+  |---|---|---|---|---|
+  | Cube | 0.20×0.35×0.14 | 9.80 kg | (0.835, -0.747, 0.325) | yes (tuned to the piston force ceiling) |
+  | Cube_01 | 0.80×0.28×0.06 | 13.44 kg | (-0.509, -0.747, 0.285) | no — needs both robots |
+  | Cube_02 | 0.10×0.40×0.05 | 2.00 kg | (0.162, -0.747, 0.280) | yes |
+  | Cylinder | ⌀0.30 × 0.10 | 7.07 kg | (0.531, -0.751, 0.305) | yes |
+
+  All masses match L×W×H×1000 density (cylinder: πr²h×1000) exactly, confirming the density-formula convention established in Session 8 still holds live.
+- Queried the real shelf-1 rail structure under `/World/Shelf`: two rail bars, one at world Y=[-1.0,-0.8], one at Y=[-0.7,-0.5], leaving a bare **0.1m gap at Y=(-0.8,-0.7)** with no material at all — every payload object above is centered at Y≈-0.75, i.e. dead center in that gap. Four corner legs (`Cube_04`-`07`), 0.08×0.08m footprint, 1.0m tall, all with real collision. Shelf 2 (`/World/Shelf2`) confirmed identical, shifted +4m in Y (gap at Y=(3.2,3.3)).
+- **Confirmed a real bug, not from log narrative**: the root-level `/Cube_03` obstacle prim (world pos (0.725, 1.328, 0.574), the same object driven around during this project's obstacle-avoidance work) has `UsdPhysics.CollisionAPI: False` in `two_robot_two_shelf.usd`. Directly compared against the proven reference world `isaac/legacy/test/robot1_cube03_test.usd`'s own `/Cube_03` — identical position/size, but `CollisionAPI: True` there. The collision was lost somewhere when this object was copied/recreated into the two-shelf scene; it was never re-applied. This means the robot can currently drive straight through Cube_03's real-world location with zero physical resistance, independent of whatever the `/scan`-based avoidance logic decides.
+- This also falsifies a comment inside `nav2_bridge_robot1.py`'s AABB touch-trigger code, which asserts both worlds' Cube_03 are equally collision-less ("matching the earlier single-robot+obstacle test's own collision-less prop") — that claim was never actually checked against the source file and is wrong.
+
+### What worked
+- Querying real USD prim data directly (headless Isaac boot + `pxr`), rather than trusting the existing log narrative, is what caught the Cube_03 collision discrepancy — the rest of the geometry narrative (object sizes/masses, the shelf's 0.1m access gap) checked out exactly against live data.
+
+### What did not work
+- N/A — this was a read-only verification pass, no live control/navigation was exercised.
+
+### Key decisions
+- None this session on the environment side — the collision fix itself was deliberately deferred by the user to a future session, not applied yet.
+
+### Dependencies
+- The recorded masses/positions above are for `two_robot_two_shelf.usd` specifically, current as of this session — if payload objects are ever resized/repositioned again (as happened repeatedly in Sessions 8-9), this table needs re-deriving, not assumed to still hold.
+- `isaac/legacy/test/robot1_cube03_test.usd` (moved this session from `isaac/test/`, see `isaac_robot.md`) is the reference copy this session's Cube_03 comparison was made against — if it's ever deleted, that comparison can no longer be independently re-verified.
+
+### [POTENTIAL FIX]
+- Apply `UsdPhysics.CollisionAPI` to `/Cube_03` in `two_robot_two_shelf.usd` (matching the reference world), then live-test whether `/scan` (the depth-camera-synthesized laser scan) actually reports it as an obstacle before/after — collision alone doesn't guarantee the camera-based detection path works, that's still unverified. Explicitly deferred by the user this session; revisit next.
+
+### [WORTH EXPLORING]
+- Whether the missing collision is the *whole* explanation for "the robot completely ignores the obstacle," or whether the `/scan`-based detection also has a real gap on top of it — not yet live-tested either way.
+
+---
+
+## Session 16 — NeuroWare (2026-08-15)
+
+### What was done
+- **Relayout for debugging clarity, not a design change**: moved the deliberate test obstacle (`/Cube_03`) and `Shelf2` out to a clean "+3 / +6 from shelf 1" convention (world Y, using shelf 1's own payload/gap center as the reference point — the same anchor already used for the delivery-mirroring convention). Shelf 2's Xform translate went from `(0,4,0)` to `(0,6,0)`; `Cube_03`'s world Y-center moved from ≈1.328 to 2.25. Shelf 1 itself and its corner legs were untouched. Reason: shelf 1's own structure (its corner leg `/World/Shelf/Cube_04` specifically) sits close enough to `Cube_03`'s old position that debugging kept conflating "shelf 1's own geometry" with "the deliberately-placed test obstacle" — this makes them unambiguous.
+- Also updated `nav2_bridge_robot1.py`'s hardcoded `CUBE03_WORLD_BBOX` constant to the new position (re-queried via the scene-dump mechanism's `world_bbox=` field after the move, not hand-computed).
+- **User-driven shelf gap widening, replicated onto shelf 2**: the user manually widened shelf 1's own rail gap live in the Isaac Sim GUI — each rail bar (`Cube_01`, `Cube_03` under `/World/Shelf`) narrowed from 0.20m to 0.15m wide, opening the gap between them from 0.10m to 0.20m — and saved. Replicated the identical structure onto shelf 2: deleted the existing `/World/Shelf2` subtree entirely and rebuilt it via `Sdf.CopySpec(/World/Shelf → /World/Shelf2)` (the same mechanism `isaac_environment.md`'s Session 2-era notes record was used to build shelf 2 originally), then re-applied the `+6` Y offset as a fresh `Translate` op (the source `/World/Shelf` Xform has no translate op of its own, so this couldn't just be copied — had to be added explicitly). Verified via a fresh reopen (not same-session trust): shelf 2's rails now read Y=[5.000,5.150] and Y=[5.350,5.500] (0.15m each, 0.2m gap between), matching shelf 1's new dimensions exactly, with the corner legs and Robot2's parked state untouched.
+- **Root-caused and fixed a real, previously-unexplained bug causing every GUI-mode session to eventually crash**: a live GUI save (during the shelf-editing session above) baked the runtime-only `/World/Ros2NavGraph` OmniGraph node permanently into the USD file. Every subsequent headless-or-GUI boot of `nav2_bridge_robot1.py` tries to create a *new* graph at that same path on startup and crashes immediately (`OmniGraphError: Failed to wrap graph in node ... A graph already exists at this path`) — this was the real cause of essentially all of today's GUI-mode instability, not general flakiness as assumed earlier in the session. Fixed by removing the stale `OmniGraph`-type prim from the file (scanned for any others of the same type while at it, found only the one) and re-saving; verified with a clean GUI boot immediately after.
+
+### What worked
+- Verifying the replicated shelf 2 structure via a genuinely fresh stage reopen rather than trusting the same Python session that made the edit — same discipline as every other USD edit this project has made.
+- Actually reading the GUI crash's real Python traceback instead of continuing to treat it as unexplained instability — the fix was a two-line prim removal once the actual cause was visible in the log.
+
+### What did not work
+- N/A this session on the environment side (no failed approaches, both changes worked on the first attempt once diagnosed).
+
+### Current state
+`two_robot_two_shelf.usd` now has: shelf 1 (user-widened gap, corner legs unchanged) mirrored cleanly onto shelf 2 at the established `+6` offset; the deliberate test obstacle (`Cube_03`) at a clean `+3` offset, no longer geometrically ambiguous with shelf 1's own structure; and no stale OmniGraph prim baked in (GUI boots cleanly now). Several timestamped `.bak_*` backups of the file accumulated in `isaac/test/` across this session's edits — not cleaned up, kept as a safety trail.
+
+### Dependencies
+- `nav2_bridge_robot1.py`'s `CUBE03_WORLD_BBOX` constant must be kept in sync with `Cube_03`'s actual position by hand — it's a hardcoded, re-queried-not-computed value; if the obstacle is ever repositioned again, this needs updating the same way (query the scene dump's `world_bbox=` field, don't guess an offset).
+- The "+3/+6 from shelf 1" convention is a *world*-frame convention specifically; the ROS/controller-facing "odom" frame that `shelf_transfer_task.py` and `rotate_drive_controller.py` actually operate in is a rotated/offset transform of this (confirmed live this session: robot spawn yaw ≈179.7°, meaning world and odom are close to a 180° rotation of each other around a non-origin spawn point) — don't assume world-frame Y deltas translate directly into odom-frame Y deltas of the same sign/magnitude without checking, as already flagged in earlier sessions' notes on this exact confusion.
+
+### [WORTH EXPLORING]
+- Whether any *other* `.usd` file in this project (not just `two_robot_two_shelf.usd`) has ever had a live OmniGraph node saved into it the same way — worth a quick scan if GUI-mode crashes recur on a different scene file.

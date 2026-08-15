@@ -24,9 +24,16 @@ though this script never imports rclpy:
     PYTHONPATH= AMENT_PREFIX_PATH= COLCON_PREFIX_PATH= ./python.sh nav2_bridge_robot1.py
 """
 from isaacsim import SimulationApp
+import os as _os_early  # needed before other imports, just for the
+                         # headless env-var check below
 
 simulation_app = SimulationApp(launch_config={
-    "headless": False,
+    # Overridable via env var (HEADLESS=1) rather than a hard default
+    # change, so GUI mode is still one env var away for live-watched
+    # work. Now that real automated checks exist (cargo attachment,
+    # plate orientation) instead of relying on screenshots, headless
+    # verification runs are viable per user request this session.
+    "headless": _os_early.environ.get("HEADLESS", "0") == "1",
     "renderer": "MinimalRendering",
     "minimal_shading_mode": 3,
     "width": 960,
@@ -51,6 +58,7 @@ import isaacsim.core.experimental.utils.app as app_utils
 from omni.kit.viewport.utility import get_active_viewport, frame_viewport_prims
 import isaacsim.core.experimental.utils.stage as stage_utils
 from isaacsim.core.experimental.prims import Articulation, RigidPrim
+from omni.physx import get_physx_scene_query_interface
 from isaacsim.sensors.camera import Camera
 from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics, Gf
 
@@ -61,7 +69,13 @@ carb.settings.get_settings().set("/app/viewport/grid/enabled", False)
 app_utils.enable_extension("isaacsim.ros2.bridge")
 simulation_app.update()
 
-USD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test", "robot1_cube03_test.usd")
+# two_robot_two_shelf.usd -- the original, full scene (both shelves,
+# Robot2, real collidable payload objects), not the minimal single-robot
+# scene used earlier this session for navigation-only testing. Robot2 is
+# present in the file but deliberately never set up/driven below, so it
+# just sits inert -- "disabled" per user request, not stripped from the
+# USD.
+USD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test", "two_robot_two_shelf.usd")
 success, stage = stage_utils.open_stage(USD_PATH)
 print(f"[nav2 bridge robot1] opened {USD_PATH} -> {success}")
 
@@ -74,17 +88,51 @@ art_api = PhysxSchema.PhysxArticulationAPI.Apply(stage.GetPrimAtPath("/World/Rob
 art_api.CreateSolverPositionIterationCountAttr(255)
 art_api.CreateSolverVelocityIterationCountAttr(64)
 
+# Isaac's Articulation physics-tensor API (get_dof_positions/get_world_poses,
+# used throughout setup below) is only valid once the timeline has played at
+# least once -- confirmed live this session: skipping this entirely raises
+# "Instance's physics tensor entity is not valid. Play the simulation/
+# timeline to re-initialize it". So play briefly to initialize it, then
+# pause again below once setup is done -- the window comes up paused and
+# ready, not auto-running, but setup still works.
 omni.timeline.get_timeline_interface().play()
 for _ in range(5):
     simulation_app.update()
 
 ROBOT_PATH = "/World/Robot/Geometry/base_link"
 
+# Overridable via env var so a boot-time sweep doesn't need a code edit
+# each time, e.g. `WHEEL_DOF_DAMPING=50 ./python.sh nav2_bridge_robot1.py`.
+# Reverted to the original 5000 -- live-tested this session and traced
+# the earlier stall to PhysX articulation sleep (see set_sleep_thresholds
+# below), not this gain; a lower damping (5.0) was tested directly and
+# made things strictly worse (even less responsive), so 5000 stands.
+WHEEL_DOF_DAMPING = float(os.environ.get("WHEEL_DOF_DAMPING", "5000.0"))
+
 def setup_robot(articulation_path):
     r = Articulation(articulation_path)
+    # PhysX puts stationary articulations to sleep after sitting under
+    # its sleep-threshold velocity for a while -- confirmed this session:
+    # the chassis responded normally to a raw /cmd_vel command right
+    # after boot, then stopped responding at all (regardless of wheel
+    # damping/effort tuning) after several minutes of live testing with
+    # the chassis mostly at rest, which only makes sense as a sleep
+    # state, not a gain problem. Threshold ~0 means it practically never
+    # qualifies as "at rest" and stays awake.
+    r.set_sleep_thresholds(0.0)
     r.set_link_masses([40.0], link_indices=r.get_link_indices(["base_link"]))
     wj = r.get_dof_indices(["front_left_wheel_joint", "front_right_wheel_joint", "rear_left_wheel_joint", "rear_right_wheel_joint"])
-    r.set_dof_gains(stiffnesses=0, dampings=5000.0, dof_indices=wj)
+    # damping=5000 here originally -- live-tested this session and found
+    # it unstable at the small commands Nav2 sends: a wheel this light
+    # has tiny rotational inertia, so a damping gain that huge relative
+    # to it causes the drive torque to overshoot and flip sign every
+    # physics substep instead of converging (classic explicit-integrator
+    # instability when gain is disproportionate to inertia) -- confirmed
+    # by testing a max-effort cap up to 50 N*m with zero improvement,
+    # which rules out "not enough torque" and points at the gain itself.
+    # WHEEL_DOF_DAMPING is set way down below at the module level once a
+    # live-tuning sweep (via /tmp/robot1_damping) finds a stable value.
+    r.set_dof_gains(stiffnesses=0, dampings=WHEEL_DOF_DAMPING, dof_indices=wj)
     r.set_dof_velocity_targets(0, dof_indices=wj)
     rp = r.get_dof_indices(["ball_roll_revolute", "ball_pitch_revolute"])
     r.set_dof_gains(stiffnesses=5000.0, dampings=200.0, dof_indices=rp)
@@ -92,6 +140,19 @@ def setup_robot(articulation_path):
     r.set_dof_position_targets(rp_base, dof_indices=rp)
     yj = r.get_dof_indices(["ball_yaw_revolute"])
     r.set_dof_gains(stiffnesses=5000.0, dampings=200.0, dof_indices=yj)
+    # Asset default is maxForce=200 (same as the piston's ORIGINAL,
+    # confirmed-too-low value before that was raised 100->200 through live
+    # testing under real load). This joint has never been torque-tested
+    # under rapid successive turns while carrying weight -- live-caught
+    # this session: real orientation drift up to ~77deg from its target
+    # during a multi-turn detour route, meaning the PD drive (stiffness
+    # 5000, damping 200) can't accelerate the joint+carried-load inertia
+    # fast enough to track a quickly-moving target, capped by this force
+    # budget. Raised here as a live runtime override (not editing the
+    # shared asset file) so it's easy to re-tune/revert -- same kind of
+    # empirical raise as the piston's, not yet confirmed as the right
+    # final value.
+    r.set_dof_max_efforts(1000.0, dof_indices=yj)
     yaw_joint_pos = float(r.get_dof_positions(dof_indices=yj).numpy()[0, 0])
     r.set_dof_position_targets(yaw_joint_pos, dof_indices=yj)
     pj = r.get_dof_indices(["centered_piston_prismatic_z"])
@@ -102,6 +163,43 @@ def setup_robot(articulation_path):
     return r, wj, rp, yj, yaw_joint_pos, pj, piston_pos
 
 robot, wheel_joints, tilt_joints, yaw_joint, yaw_joint_base, piston_joint, piston_target = setup_robot(ROBOT_PATH)
+
+# Robot2 is deliberately never driven (no camera, no yaw compensation, no
+# navigation) -- "disabled" per user request. But its USD default wheel
+# joint state carries a nonzero velocity target from whenever
+# two_robot_pickup_demo.py last drove it and the scene was saved --
+# confirmed live this session: left completely untouched, it slides at
+# ~0.65 m/s indefinitely. setup_robot() zeroes drive targets/sets real
+# gains for every joint (same as Robot1's own setup below) -- calling it
+# here only parks Robot2 in place, it does not add any active control.
+ROBOT2_PATH = "/World/Robot2/Geometry/base_link"
+setup_robot(ROBOT2_PATH)
+
+# Pickup/carry constants ported directly from two_robot_pickup_demo.py --
+# real, live-tuned values from that script's proven pickup sequence, not
+# re-derived here. PISTON_REST is this robot's own real starting piston
+# position (read from the joint at setup, not a guessed constant).
+PISTON_REST = piston_target
+LIFT_TARGET = 0.18
+CARGO_DROP_TOLERANCE = 0.08  # meters, matches two_robot_pickup_demo.py
+CARGO_STATUS_FILE = "/tmp/robot1_cargo_status"  # "attached:<path>" / "none"
+                                                  # / "dropped" -- written
+                                                  # whenever this changes,
+                                                  # so an external
+                                                  # orchestrator can check
+                                                  # real attachment instead
+                                                  # of trusting an open-loop
+                                                  # lift sequence completed.
+carrying_path = None    # prim path of whatever's currently on the plate,
+carrying_offset = None  # (dx, dy, dz) from chassis at the moment it was
+                        # lifted, or None if nothing -- ground truth, not
+                        # inferred. Checking the object's position
+                        # RELATIVE to the moving chassis, not just its
+                        # absolute Z, since a sideways knock (e.g. from
+                        # clipping shelf structure) can push cargo off
+                        # the plate without dropping much in height --
+                        # confirmed live this session: a real fall-off
+                        # went undetected by a Z-only check.
 
 # Same 4-corner depth camera layout as robot1_cube03_live_test.py -- kept
 # for later LaserScan publishing (task #19), unused by the graph so far.
@@ -187,24 +285,68 @@ def _sample_camera_range(cam, local_angle_in_cam_frame):
     finite = col_vals[np.isfinite(col_vals)]
     return min(float(finite.min()), SCAN_MAX_RANGE) if finite.size else SCAN_MAX_RANGE
 
+CAMERA_OVERLAP_RECONCILE_TOL = 0.1  # meters -- the 4 corner cameras are
+                                  # separate physical viewpoints, so where
+                                  # their 90deg FOVs overlap they see the
+                                  # same real surface at different parallax,
+                                  # not a genuine disagreement. If two
+                                  # cameras' readings at the same body-frame
+                                  # angle are within this of each other,
+                                  # average them into one consistent value
+                                  # instead of the old naive min() (which
+                                  # could flip abruptly between cameras
+                                  # sample to sample at the seam, producing
+                                  # a jagged boundary for one real smooth
+                                  # surface -- "layering" that fed spurious
+                                  # occupied cells into the costmap/planner).
+                                  # A genuine disagreement beyond this
+                                  # tolerance (e.g. one camera sees past an
+                                  # edge the other can't) still keeps the
+                                  # closer/more conservative reading.
+SMOOTH_MEDIAN_WINDOW = 3         # odd window (samples either side of each
+                                  # angle) -- knocks out single-sample
+                                  # seam/edge-grazing noise spikes before
+                                  # they reach the costmap.
+
+def _median_smooth(values, window):
+    """Circular median filter -- this is a full 360deg scan, so angle
+    index 0 and index -1 are physically adjacent, not a hard edge."""
+    half = window // 2
+    n = len(values)
+    out = []
+    for i in range(n):
+        neighborhood = sorted(values[(i + k) % n] for k in range(-half, half + 1))
+        out.append(neighborhood[len(neighborhood) // 2])
+    return out
+
 def synthesize_laser_ranges(cams):
     """One range per fixed robot-frame angle (LASER_NUM_SAMPLES evenly
     spaced from -pi to pi, matching ROS2PublishLaserScan's azimuthRange
-    [-180,180]), picking whichever corner camera's FOV covers that
-    direction. Returned in increasing-azimuth order, as the node
-    requires."""
+    [-180,180]). Where more than one corner camera's FOV covers a given
+    direction, reconciles their readings (see CAMERA_OVERLAP_RECONCILE_TOL)
+    instead of naively taking whichever is smaller. Returned in increasing-
+    azimuth order, as the node requires."""
     ranges = []
     for i in range(LASER_NUM_SAMPLES):
         angle = LASER_ANGLE_MIN + i * LASER_ANGLE_INC
-        best = SCAN_MAX_RANGE
+        hits = []
         for cam, (_, _, cam_yaw_deg) in zip(cams, CAMERA_CORNERS):
             local_angle = angle - math.radians(cam_yaw_deg)
             local_angle = math.atan2(math.sin(local_angle), math.cos(local_angle))
             r = _sample_camera_range(cam, local_angle)
             if r is not None:
-                best = min(best, r)
-        ranges.append(best)
-    return ranges
+                hits.append(r)
+        if not hits:
+            ranges.append(SCAN_MAX_RANGE)
+        elif len(hits) == 1:
+            ranges.append(hits[0])
+        else:
+            lo, hi = min(hits), max(hits)
+            if hi - lo <= CAMERA_OVERLAP_RECONCILE_TOL:
+                ranges.append(sum(hits) / len(hits))
+            else:
+                ranges.append(lo)
+    return _median_smooth(ranges, SMOOTH_MEDIAN_WINDOW)
 
 def get_xy_yaw(r):
     pos, quat = r.get_world_poses()
@@ -218,7 +360,47 @@ def apply_yaw_compensation(r, yj, yaw_base, chassis_yaw0):
     delta = math.atan2(math.sin(chassis_yaw - chassis_yaw0), math.cos(chassis_yaw - chassis_yaw0))
     r.set_dof_position_targets(yaw_base - delta, dof_indices=yj)
 
+def raycast_from(pos, dir_xy, max_dist=1.0, start_offset=0.2):
+    """Ground-truth PhysX raycast -- same pattern as
+    two_robot_pickup_demo.py's identify_obstacle(), reused directly
+    rather than re-derived. start_offset pushes the ray's actual start
+    point out from pos by this much first, so it doesn't immediately
+    self-hit whatever body pos is inside/on the surface of (confirmed
+    live this session: without this, every direction hit distance 0.0
+    against the robot's/cargo's own collision geometry). Returned
+    distance is measured from the ORIGINAL pos, not the offset start, so
+    it's directly comparable to a real-world clearance number. Returns
+    (hit_body_path, distance) or (None, None)."""
+    dx, dy = dir_xy
+    mag = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / mag, dy / mag
+    start = (pos[0] + ux * start_offset, pos[1] + uy * start_offset, pos[2])
+    hit = get_physx_scene_query_interface().raycast_closest(
+        carb.Float3(float(start[0]), float(start[1]), float(start[2])),
+        carb.Float3(float(ux), float(uy), 0.0),
+        max(0.01, max_dist - start_offset),
+        bothSides=True,
+    )
+    if hit and hit.get("rigidBody"):
+        return hit["rigidBody"], hit["distance"] + start_offset
+    return None, None
+
 _, _, chassis_yaw0 = get_xy_yaw(robot)
+
+# Real-world plate-orientation check, added after live-catching a bug
+# this session where apply_yaw_compensation was computing the right
+# counter-rotation target every tick but a leftover manual-keyboard-
+# control code path was silently overwriting it on the same joint a few
+# lines later -- the compensation never actually reached the joint, and
+# nothing was checking, so it went undetected until a carried object
+# visibly swung into other objects. This checks the plate's REAL world
+# orientation (not just whether the right joint target was set) against
+# its own orientation at startup, continuously.
+PLATE_PATH = "actuator_outer_cylinder_link/piston_rod_link/ball_joint_center_link/ball_roll_link/ball_pitch_link/ball_yaw_link/contact_plate_link"
+plate = RigidPrim(f"{ROBOT_PATH}/{PLATE_PATH}")
+_, _, plate_yaw0 = get_xy_yaw(plate)
+PLATE_ORIENTATION_TOLERANCE = math.radians(5.0)
+PLATE_ORIENTATION_STATUS_FILE = "/tmp/robot1_plate_orientation"
 
 # Real wheel geometry, confirmed directly from physics.usda earlier this
 # session -- wheel cylinder radius=0.04m, joint localPos y=+-0.087 (track
@@ -348,6 +530,12 @@ print(f"[nav2 bridge robot1] built ROS2 OmniGraph at {GRAPH_PATH} with {len(node
 for _ in range(5):
     simulation_app.update()
 
+# Setup is done and physics tensors are initialized -- pause here so the
+# robot sits still until you press Play yourself, instead of driving off
+# during the rest of this script's startup.
+omni.timeline.get_timeline_interface().pause()
+print("[nav2 bridge robot1] paused -- press Play in the Isaac Sim window when ready")
+
 # Cached once -- og.Controller.set() is called on this every tick with
 # fresh camera data, entirely on the Kit/OmniGraph side (no rclpy).
 _scan_data_attr = og.Controller.attribute(f"{GRAPH_PATH}/PublishScan.inputs:linearDepthData")
@@ -409,10 +597,6 @@ def spawn_marker_at_odom_goal(odom_x, odom_y, label="goal"):
     wy = _spawn_y + odom_x * s + odom_y * c
     return spawn_marker_at(wx, wy, label=label)
 
-# Mark the same goal sent in the earlier successful test run, so it's
-# visible immediately without needing a keypress.
-spawn_marker_at_odom_goal(-2.532, 3.997, label="nav2 goal")
-
 input_interface = carb.input.acquire_input_interface()
 keyboard = omni.appwindow.get_default_app_window().get_keyboard()
 
@@ -440,12 +624,353 @@ last_time = time.perf_counter()
 _tick_count = 0
 DEPTH_PRINT_INTERVAL = 60
 
+# Remote play/pause control -- no GUI automation available to click the
+# window's own Play button from outside the process, so this polls a
+# plain control file each tick instead: `echo play >
+# /tmp/robot1_play_control` / `echo pause > ...`. Doesn't reintroduce
+# auto-play-at-launch (still starts paused, per this session's fix --
+# nothing writes this file until explicitly told to).
+PLAY_CONTROL_FILE = "/tmp/robot1_play_control"
+_last_play_control = None
+# Live wheel-damping sweep -- avoids a ~150s Isaac reboot per guess.
+# `echo 5.0 > /tmp/robot1_damping`.
+DAMPING_CONTROL_FILE = "/tmp/robot1_damping"
+_last_damping = None
+# Remote obstacle spawn, for testing replanning without a keyboard --
+# `echo "-1.0,2.5" > /tmp/robot1_spawn_obstacle` drops a real (but
+# robot-collision-filtered) marker at that ODOM-frame x,y, same object
+# spawn_marker_at_odom_goal already uses for goals -- it's just as
+# visible to /scan either way, which is all that matters for a costmap
+# obstacle test.
+SPAWN_OBSTACLE_FILE = "/tmp/robot1_spawn_obstacle"
+_last_obstacle_spawn = None
+# Remote position query -- lets an outside script read back where a prim
+# (e.g. a marker the user manually dragged in the viewport) currently is,
+# converted to odom frame same as goals/obstacles are specified in.
+# `echo /Waypoint_0 > /tmp/robot1_query_marker`, then read
+# /tmp/robot1_query_response for "odom_x,odom_y".
+QUERY_MARKER_FILE = "/tmp/robot1_query_marker"
+QUERY_RESPONSE_FILE = "/tmp/robot1_query_response"
+# Real scene ground truth -- lists every direct child of /World with its
+# type and REAL world-space bounding box (odom-converted), not just an
+# Xform's pivot/origin. Added after repeatedly assuming a shelf/obstacle
+# prim's Xform translate was a usable target point without ever checking
+# its actual footprint.
+SCENE_DUMP_FILE = "/tmp/robot1_scene_dump"
+SCENE_DUMP_RESPONSE_FILE = "/tmp/robot1_scene_dump_response"
+# Remote toggle for apply_yaw_compensation -- `echo off > .../robot1_yaw_compensation`
+# suspends it (the plate just passively rides along with the chassis,
+# no active counter-rotation), `echo on > ...` resumes it. Added so a
+# long, multi-turn carry leg doesn't force the yaw joint to continuously
+# chase a rapidly-changing target it isn't torqued for -- suspend during
+# the noisy transit, only actively hold/correct orientation when it
+# actually matters (stationary, at a precision waypoint). Defaults to
+# on/enabled so every other existing use of this bridge is unaffected.
+YAW_COMPENSATION_CONTROL_FILE = "/tmp/robot1_yaw_compensation"
+_yaw_compensation_enabled = True
+_last_yaw_compensation_cmd = None
+# Remote pickup/place control -- `echo lift:/Cube > /tmp/robot1_piston_cmd`
+# ramps to LIFT_TARGET and starts ground-truth cargo tracking on that
+# prim; `echo lower > ...` ramps back to this robot's real rest position
+# (PISTON_REST). Writes "lifted"/"lowered" to PISTON_STATUS_FILE once the
+# ramp actually completes, so an external orchestrator can poll for real
+# completion instead of guessing a sleep duration.
+PISTON_CONTROL_FILE = "/tmp/robot1_piston_cmd"
+PISTON_STATUS_FILE = "/tmp/robot1_piston_status"
+_piston_remote_target = None  # None = no override, R/C keys still work
+# Ground-truth obstacle-touch file, written every tick (not a polled
+# command -- a live sensor value): "clear", or a comma-joined list of
+# which bodies (chassis / the carried prim's path) currently overlap
+# Cube_03's real footprint. See the AABB-overlap block below for why.
+CARRY_OBSTACLE_FILE = "/tmp/robot1_carry_obstacle"
+# Real world bbox for the shelves-world /Cube_03 obstacle, queried once via
+# SCENE_DUMP_FILE this session -- not guessed, matches the "real position,
+# queried directly... not guessed" discipline robot1_cube03_live_test.py
+# uses for its own CUBE03_X/CUBE03_Y.
+CUBE03_WORLD_BBOX = ((0.225, 1.750), (1.225, 2.750))  # (min_x,min_y),(max_x,max_y)
+# Updated 2026-08-15: Cube_03 moved from world Y-center 1.328 to 2.25
+# (shelf-2/obstacle relayout, obstacle now at "+3 from shelf 1" on its own
+# clean axis instead of sitting close enough to shelf 1's own structure to
+# be ambiguous with it) -- re-queried via SCENE_DUMP_FILE's world_bbox=
+# field after the move, not hand-computed.
+CHASSIS_HALF_X, CHASSIS_HALF_Y = 0.15, 0.075  # same real chassis half-extents occupancy_grid.py uses
+_touch_bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+_obstacle_touching = False
+
+def _aabb_overlap(cx, cy, half_x, half_y, bbox):
+    (bx0, by0), (bx1, by1) = bbox
+    return (cx + half_x >= bx0 and cx - half_x <= bx1 and
+            cy + half_y >= by0 and cy - half_y <= by1)
+# Remote clearance diagnostic -- `echo x > /tmp/robot1_diag` writes real
+# wheel velocities (target vs actual) and raycasts from the chassis and
+# (if carrying something) the cargo, in the 4 world-axis directions, to
+# /tmp/robot1_diag_response. Ground truth, not reasoning about mount
+# geometry on paper -- same discipline as two_robot_pickup_demo.py's
+# identify_obstacle() from earlier sessions.
+DIAG_FILE = "/tmp/robot1_diag"
+DIAG_RESPONSE_FILE = "/tmp/robot1_diag_response"
+
 while simulation_app.is_running():
     now = time.perf_counter()
     dt = now - last_time
     last_time = now
 
-    apply_yaw_compensation(robot, yaw_joint, yaw_joint_base, chassis_yaw0)
+    if os.path.exists(PLAY_CONTROL_FILE):
+        with open(PLAY_CONTROL_FILE) as f:
+            _cmd = f.read().strip()
+        if _cmd != _last_play_control:
+            if _cmd == "play":
+                omni.timeline.get_timeline_interface().play()
+                print("[nav2 bridge robot1] play (remote)", flush=True)
+            elif _cmd == "pause":
+                omni.timeline.get_timeline_interface().pause()
+                print("[nav2 bridge robot1] pause (remote)", flush=True)
+            _last_play_control = _cmd
+
+    if os.path.exists(YAW_COMPENSATION_CONTROL_FILE):
+        with open(YAW_COMPENSATION_CONTROL_FILE) as f:
+            _yc_cmd = f.read().strip()
+        if _yc_cmd != _last_yaw_compensation_cmd:
+            if _yc_cmd == "off":
+                _yaw_compensation_enabled = False
+                print("[nav2 bridge robot1] yaw compensation SUSPENDED (remote)", flush=True)
+            elif _yc_cmd == "on":
+                _yaw_compensation_enabled = True
+                print("[nav2 bridge robot1] yaw compensation RESUMED (remote)", flush=True)
+            _last_yaw_compensation_cmd = _yc_cmd
+
+    if os.path.exists(DAMPING_CONTROL_FILE):
+        with open(DAMPING_CONTROL_FILE) as f:
+            _damping_cmd = f.read().strip()
+        if _damping_cmd != _last_damping:
+            try:
+                robot.set_dof_gains(stiffnesses=0, dampings=float(_damping_cmd), dof_indices=wheel_joints)
+                print(f"[nav2 bridge robot1] wheel damping -> {_damping_cmd} (remote)", flush=True)
+            except ValueError:
+                pass
+            _last_damping = _damping_cmd
+
+    if os.path.exists(SPAWN_OBSTACLE_FILE):
+        with open(SPAWN_OBSTACLE_FILE) as f:
+            _obs_cmd = f.read().strip()
+        if _obs_cmd != _last_obstacle_spawn:
+            try:
+                ox, oy = (float(v) for v in _obs_cmd.split(","))
+                spawn_marker_at_odom_goal(ox, oy, label="obstacle (remote)")
+            except ValueError:
+                pass
+            _last_obstacle_spawn = _obs_cmd
+
+    if os.path.exists(QUERY_MARKER_FILE):
+        with open(QUERY_MARKER_FILE) as f:
+            _query_path = f.read().strip()
+        # Trigger on the response file being absent (the client's own
+        # signal that it wants a fresh answer -- it deletes the response
+        # before writing the marker), not on the marker content changing --
+        # a content-equality check silently drops a repeat query for the
+        # same prim, which a real caller does all the time.
+        if _query_path and not os.path.exists(QUERY_RESPONSE_FILE):
+            prim = stage.GetPrimAtPath(_query_path)
+            if prim.IsValid():
+                wt = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                wx, wy, wz = wt.ExtractTranslation()
+                c, s = math.cos(-chassis_yaw0), math.sin(-chassis_yaw0)
+                dx, dy = wx - _spawn_x, wy - _spawn_y
+                odom_x = dx * c - dy * s
+                odom_y = dx * s + dy * c
+                # wz needs no odom transform -- the world<->odom rotation is
+                # about the Z axis only (spawn yaw), so Z passes through
+                # unchanged. Appended as a 3rd field -- existing callers
+                # that only unpack 2 values (query_prim_odom_xy) are
+                # untouched, this is purely additive.
+                with open(QUERY_RESPONSE_FILE, "w") as out:
+                    out.write(f"{odom_x:.4f},{odom_y:.4f},{wz:.4f}")
+
+    if os.path.exists(SCENE_DUMP_FILE):
+        with open(SCENE_DUMP_FILE) as f:
+            _dump_cmd = f.read().strip()
+        if _dump_cmd and not os.path.exists(SCENE_DUMP_RESPONSE_FILE):
+            _bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+            _c, _s = math.cos(-chassis_yaw0), math.sin(-chassis_yaw0)
+            def _to_odom(wx, wy):
+                _dx, _dy = wx - _spawn_x, wy - _spawn_y
+                return _dx * _c - _dy * _s, _dx * _s + _dy * _c
+            _lines = []
+            for _child in stage.GetPrimAtPath("/World").GetChildren():
+                try:
+                    _rng = _bbox_cache.ComputeWorldBound(_child).ComputeAlignedRange()
+                    _mn, _mx = _rng.GetMin(), _rng.GetMax()
+                    _ox0, _oy0 = _to_odom(_mn[0], _mn[1])
+                    _ox1, _oy1 = _to_odom(_mx[0], _mx[1])
+                    _lines.append(f"{_child.GetPath()} [{_child.GetTypeName()}] "
+                                  f"world_bbox=({_mn[0]:.3f},{_mn[1]:.3f},{_mn[2]:.3f})-({_mx[0]:.3f},{_mx[1]:.3f},{_mx[2]:.3f}) "
+                                  f"odom_bbox=({_ox0:.3f},{_oy0:.3f})-({_ox1:.3f},{_oy1:.3f})")
+                except Exception as _e:
+                    _lines.append(f"{_child.GetPath()} [{_child.GetTypeName()}] bbox error: {_e}")
+            # A direct-children-only dump misses anything nested under a
+            # group (e.g. a prop parented under a shelf's Xform instead of
+            # sitting directly under /World) -- full recursive scan for
+            # actual geometry types, skipping the robots' own internal
+            # links (pure noise -- dozens of sub-links per robot). Scoped
+            # to the WHOLE STAGE, not just /World -- confirmed live this
+            # session that /Cube (the actual carried payload) is a
+            # root-level sibling of /World, not nested under it, so a
+            # /World-only scan structurally cannot see it or anything
+            # else living at that same root level (e.g. a real obstacle).
+            _lines.append("--- full recursive geometry scan (whole stage, excluding /World/Robot*) ---")
+            for _prim in Usd.PrimRange(stage.GetPseudoRoot()):
+                _path = str(_prim.GetPath())
+                if _path.startswith("/World/Robot"):
+                    continue
+                if _prim.GetTypeName() not in ("Mesh", "Cube", "Sphere", "Cylinder", "Cone"):
+                    continue
+                try:
+                    _rng = _bbox_cache.ComputeWorldBound(_prim).ComputeAlignedRange()
+                    _mn, _mx = _rng.GetMin(), _rng.GetMax()
+                    _ox0, _oy0 = _to_odom(_mn[0], _mn[1])
+                    _ox1, _oy1 = _to_odom(_mx[0], _mx[1])
+                    _has_collision = _prim.HasAPI(UsdPhysics.CollisionAPI)
+                    _lines.append(f"{_path} [{_prim.GetTypeName()}] collision={_has_collision} "
+                                  f"world_bbox=({_mn[0]:.3f},{_mn[1]:.3f},{_mn[2]:.3f})-({_mx[0]:.3f},{_mx[1]:.3f},{_mx[2]:.3f}) "
+                                  f"odom_bbox=({_ox0:.3f},{_oy0:.3f})-({_ox1:.3f},{_oy1:.3f})")
+                except Exception as _e:
+                    _lines.append(f"{_path} [{_prim.GetTypeName()}] bbox error: {_e}")
+            with open(SCENE_DUMP_RESPONSE_FILE, "w") as out:
+                out.write("\n".join(_lines))
+
+    if os.path.exists(PISTON_CONTROL_FILE):
+        with open(PISTON_CONTROL_FILE) as f:
+            _piston_cmd = f.read().strip()
+        # Consume-and-delete, not a content-equality gate -- a leftover
+        # command file from a crashed prior run (confirmed live: a stale
+        # "lift:/Cube" survived a bridge restart and replayed itself into
+        # the piston target on the very first tick of the fresh process,
+        # lifting before Play was even pressed and before anything asked
+        # for it) must never be able to fire again just because a new
+        # process's _last_piston_cmd starts at None.
+        os.remove(PISTON_CONTROL_FILE)
+        if _piston_cmd:
+            if _piston_cmd.startswith("lift"):
+                parts = _piston_cmd.split(":", 1)
+                carrying_path = parts[1] if len(parts) > 1 else None
+                _piston_remote_target = LIFT_TARGET
+                print(f"[nav2 bridge robot1] piston lift -> {carrying_path} (remote)", flush=True)
+            elif _piston_cmd == "lower":
+                _piston_remote_target = PISTON_REST
+                print("[nav2 bridge robot1] piston lower (remote)", flush=True)
+
+    if _piston_remote_target is not None:
+        if piston_target < _piston_remote_target:
+            piston_target = min(_piston_remote_target, piston_target + Piston_speed * dt)
+        else:
+            piston_target = max(_piston_remote_target, piston_target - Piston_speed * dt)
+        robot.set_dof_position_targets(piston_target, dof_indices=piston_joint)
+        if abs(piston_target - _piston_remote_target) < 1e-4:
+            reached_lift = _piston_remote_target == LIFT_TARGET
+            with open(PISTON_STATUS_FILE, "w") as out:
+                out.write("lifted" if reached_lift else "lowered")
+            if reached_lift and carrying_path:
+                ox, oy, oz = RigidPrim(carrying_path).get_world_poses()[0].numpy()[0]
+                cx, cy, _ = get_xy_yaw(robot)
+                carrying_offset = (float(ox - cx), float(oy - cy), float(oz))
+                with open(CARGO_STATUS_FILE, "w") as out:
+                    out.write(f"attached:{carrying_path}")
+            else:
+                carrying_path = None
+                carrying_offset = None
+                with open(CARGO_STATUS_FILE, "w") as out:
+                    out.write("none")
+            _piston_remote_target = None
+
+    if carrying_path and carrying_offset is not None:
+        ox, oy, oz = RigidPrim(carrying_path).get_world_poses()[0].numpy()[0]
+        cx, cy, _ = get_xy_yaw(robot)
+        exp_dx, exp_dy, exp_z = carrying_offset
+        horiz_drift = math.hypot((ox - cx) - exp_dx, (oy - cy) - exp_dy)
+        if oz < exp_z - CARGO_DROP_TOLERANCE or horiz_drift > CARGO_DROP_TOLERANCE:
+            print(f"[nav2 bridge robot1] WARNING: {carrying_path} came off the plate -- "
+                  f"z {exp_z:.3f} -> {oz:.3f}, horizontal drift {horiz_drift:.3f}m", flush=True)
+            carrying_path = None
+            carrying_offset = None
+            with open(CARGO_STATUS_FILE, "w") as out:
+                out.write("dropped")
+
+    # Ground-truth "did we actually touch the obstacle" test trigger. The
+    # raycast_from_excluding() approach this block used to run was a dead
+    # end: /Cube_03 (the real obstacle, confirmed via SCENE_DUMP_FILE --
+    # world_bbox=(0.225,0.828,0.074)-(1.225,1.828,1.074), collision=False)
+    # has no physics collision, so a PhysX raycast can never see it,
+    # matching the earlier single-robot+obstacle test's own collision-less
+    # prop. Per direct instruction, this checks real, known 2D AABB overlap
+    # instead -- chassis position (+/- its real half-extents, same
+    # CHASSIS_HALF_X/Y occupancy_grid.py uses) and, if carrying something,
+    # that object's own live bbox (BBoxCache, not a guessed half-extent)
+    # against Cube_03's real bbox queried above. This is independent of
+    # whatever avoidance logic is running -- it's ground truth for whether
+    # contact actually happened, used to verify the fix, not a detection
+    # mechanism the controller reacts to.
+    _cx, _cy, _cyaw = get_xy_yaw(robot)
+    _touch_bodies = []
+    if _aabb_overlap(_cx, _cy, CHASSIS_HALF_X, CHASSIS_HALF_Y, CUBE03_WORLD_BBOX):
+        _touch_bodies.append("chassis")
+    if carrying_path:
+        try:
+            _cargo_rng = _touch_bbox_cache.ComputeWorldBound(
+                stage.GetPrimAtPath(carrying_path)).ComputeAlignedRange()
+            _cmn, _cmx = _cargo_rng.GetMin(), _cargo_rng.GetMax()
+            if _cmx[0] >= CUBE03_WORLD_BBOX[0][0] and _cmn[0] <= CUBE03_WORLD_BBOX[1][0] and \
+               _cmx[1] >= CUBE03_WORLD_BBOX[0][1] and _cmn[1] <= CUBE03_WORLD_BBOX[1][1]:
+                _touch_bodies.append(carrying_path)
+        except Exception:
+            pass
+    _now_touching = bool(_touch_bodies)
+    with open(CARRY_OBSTACLE_FILE, "w") as out:
+        out.write(",".join(_touch_bodies) if _touch_bodies else "clear")
+    if _now_touching and not _obstacle_touching:
+        print(f"[nav2 bridge robot1] *** OBSTACLE TOUCH TRIGGERED *** {_touch_bodies} overlapping "
+              f"Cube_03's real footprint -- chassis=({_cx:.3f},{_cy:.3f}) carrying={carrying_path}", flush=True)
+    elif _obstacle_touching and not _now_touching:
+        print("[nav2 bridge robot1] obstacle touch cleared", flush=True)
+    _obstacle_touching = _now_touching
+
+    _, _, plate_yaw_now = get_xy_yaw(plate)
+    plate_yaw_err = math.atan2(math.sin(plate_yaw_now - plate_yaw0), math.cos(plate_yaw_now - plate_yaw0))
+    if abs(plate_yaw_err) > PLATE_ORIENTATION_TOLERANCE:
+        print(f"[nav2 bridge robot1] WARNING: plate orientation drifted {math.degrees(plate_yaw_err):.1f}deg from startup", flush=True)
+        with open(PLATE_ORIENTATION_STATUS_FILE, "w") as out:
+            out.write(f"drifted:{math.degrees(plate_yaw_err):.1f}")
+    else:
+        with open(PLATE_ORIENTATION_STATUS_FILE, "w") as out:
+            out.write("ok")
+
+    if os.path.exists(DIAG_FILE):
+        with open(DIAG_FILE) as f:
+            _diag_cmd = f.read().strip()
+        # Trigger on the response file being absent, not on the request
+        # content changing -- a content-equality gate silently drops a
+        # repeat request for the same command, exactly like the query-file
+        # bug found and fixed earlier this session.
+        if _diag_cmd and not os.path.exists(DIAG_RESPONSE_FILE):
+            lines = []
+            wvel = robot.get_dof_velocities(dof_indices=wheel_joints).numpy()[0]
+            lines.append(f"wheel velocities (actual): {wvel.tolist()}")
+            lines.append(f"max_abs_wheel_velocity: {float(max(abs(v) for v in wvel)):.4f}")
+            cx, cy, cyaw = get_xy_yaw(robot)
+            lines.append(f"chassis pos=({cx:.3f},{cy:.3f}) yaw={math.degrees(cyaw):.1f}deg")
+            for label, (dx, dy) in [("+X", (1, 0)), ("-X", (-1, 0)), ("+Y", (0, 1)), ("-Y", (0, -1))]:
+                body, dist = raycast_from((cx, cy, 0.15), (dx, dy))
+                lines.append(f"  chassis raycast {label}: {body} @ {dist}")
+            if carrying_path:
+                ox, oy, oz = RigidPrim(carrying_path).get_world_poses()[0].numpy()[0]
+                lines.append(f"cargo {carrying_path} pos=({ox:.3f},{oy:.3f},{oz:.3f})")
+                for label, (dx, dy) in [("+X", (1, 0)), ("-X", (-1, 0)), ("+Y", (0, 1)), ("-Y", (0, -1))]:
+                    body, dist = raycast_from((ox, oy, oz), (dx, dy))
+                    lines.append(f"  cargo raycast {label}: {body} @ {dist}")
+            with open(DIAG_RESPONSE_FILE, "w") as out:
+                out.write("\n".join(lines))
+
+    if _yaw_compensation_enabled:
+        apply_yaw_compensation(robot, yaw_joint, yaw_joint_base, chassis_yaw0)
 
     piston_up = carb.input.KeyboardInput.R in held_keys
     piston_down = carb.input.KeyboardInput.C in held_keys
@@ -477,11 +1002,35 @@ while simulation_app.is_running():
 
     robot.set_dof_velocity_targets([roll_vel, pitch_vel], dof_indices=tilt_joints)
 
-    if yaw_left:
-        manual_yaw_target += Tilt_speed * dt
-    elif yaw_right:
-        manual_yaw_target -= Tilt_speed * dt
-    robot.set_dof_position_targets(manual_yaw_target, dof_indices=yaw_joint)
+    if yaw_left or yaw_right:
+        # Manual keyboard override -- only write to the yaw joint while a
+        # key is actually held. This used to run unconditionally every
+        # tick regardless of key state, which silently overwrote
+        # apply_yaw_compensation's counter-rotation target immediately
+        # after it was set a few lines above (same joint, called later in
+        # the same tick) -- the counter-rotation was computing correctly
+        # but never actually reaching the joint. Confirmed live this
+        # session: the carried object was swinging with the chassis
+        # during a turn instead of holding its orientation, and this
+        # leftover manual-control code (predating the Nav2 migration,
+        # never updated for it) was the real cause, not a speed/lag issue.
+        if yaw_left:
+            manual_yaw_target += Tilt_speed * dt
+        elif yaw_right:
+            manual_yaw_target -= Tilt_speed * dt
+        robot.set_dof_position_targets(manual_yaw_target, dof_indices=yaw_joint)
+    else:
+        # get_dof_positions has crashed the whole process twice tonight in
+        # GUI mode (both idle-paused and during active play) with "physics
+        # tensor entity is not valid" -- a real Isaac Sim quirk, not
+        # something fixable from here. Skipping one tick's resync on a
+        # transient failure is harmless (manual_yaw_target only matters
+        # when Q/E is actually pressed) and far better than losing the
+        # whole process and every other check running this tick.
+        try:
+            manual_yaw_target = float(robot.get_dof_positions(dof_indices=yaw_joint).numpy()[0, 0])
+        except AssertionError as _e:
+            print(f"[nav2 bridge robot1] WARNING: get_dof_positions failed this tick ({_e}) -- skipping manual_yaw_target resync", flush=True)
 
     og.Controller.set(_scan_data_attr, synthesize_laser_ranges(depth_cams1))
 

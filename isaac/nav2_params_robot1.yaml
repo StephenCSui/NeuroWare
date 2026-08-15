@@ -114,58 +114,84 @@ controller_server:
                                         # that's Nav2's own controller
                                         # precision, not our exact-turn
                                         # primitive)
+    # Switched from DWB to Regulated Pure Pursuit this session. DWB samples
+    # combined (vx, vtheta) arcs by design -- on this skid-steer chassis
+    # that produced slow, curving turn-while-driving motion instead of a
+    # clean rotate-then-drive, and live testing showed it repeatedly
+    # failing to converge (12x "Failed to make progress" in one run,
+    # cmd_vel_nav pinned at max rotation with non-converging yaw). RPP's
+    # use_rotate_to_heading gives an explicit stop-rotate-drive behavior
+    # instead. Note: use_rotate_to_heading and allow_reversing are
+    # mutually exclusive in RPP (the controller forces allow_reversing
+    # off with a warning if both are set) -- confirmed user priority is
+    # no-arcing over reverse-while-driving, so allow_reversing stays
+    # false here. The BackUp recovery behavior (behavior_server, below)
+    # still provides reverse motion when the robot is stuck, unaffected
+    # by this choice.
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: True
-      min_vel_x: 0.0
-      min_vel_y: 0.0
-      max_vel_x: 0.15                 # real max ~0.2 m/s (5 rad/s wheel
-                                        # speed * 0.04m radius, confirmed
-                                        # this session), kept under that
-                                        # for margin
-      max_vel_y: 0.0
-      max_vel_theta: 1.0              # under the real differential max
-                                        # (~2.3 rad/s at full opposite
-                                        # wheel speed, track width 0.174m)
-      min_speed_xy: 0.0
-      max_speed_xy: 0.15
-      min_speed_theta: 0.0
-      acc_lim_x: 0.3                  # this robot ramps to full speed
-                                        # over ~1.5s (RAMP_STEPS=90 in the
-                                        # hand-rolled scripts) -- far
-                                        # gentler than turtlebot3's 2.5,
-                                        # scaled to match real behavior
-      acc_lim_y: 0.0
-      acc_lim_theta: 1.5
-      decel_lim_x: -0.3
-      decel_lim_y: 0.0
-      decel_lim_theta: -1.5
-      vx_samples: 20
-      vy_samples: 5
-      vtheta_samples: 20
-      sim_time: 1.7
-      linear_granularity: 0.05
-      angular_granularity: 0.025
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.15        # same real-max-derived cap used by
+                                        # the old DWB config
+      rotate_to_heading_angular_vel: 1.0   # matches old max_vel_theta
+      max_angular_accel: 25.0         # was 1.5, then 6.0 -- live-tested
+                                        # this session: RPP's rotate-to-
+                                        # heading ramp steps up from the
+                                        # REAL odom-measured current
+                                        # speed each cycle (controller_
+                                        # frequency=20, dt=0.05s), not
+                                        # from the last commanded value
+                                        # or a persistent ramp state. As
+                                        # long as achieved velocity lags
+                                        # (chassis still building up
+                                        # rotational momentum -- confirmed
+                                        # this needs several real seconds
+                                        # of a held-CONSTANT command, via
+                                        # a clean raw /cmd_vel test that
+                                        # converged to ~0.39 rad/s over
+                                        # ~4-5s), every cycle recomputes
+                                        # the SAME small step from that
+                                        # same near-zero base, capping the
+                                        # command at accel*dt forever
+                                        # instead of ever reaching
+                                        # rotate_to_heading_angular_vel.
+                                        # At 6.0 that cap was ~0.3 rad/s
+                                        # (measured: real yaw barely
+                                        # moved, 0.67deg over 10s, despite
+                                        # a "stable-looking" 0.25-0.3
+                                        # rad/s command). 25.0 makes
+                                        # accel*dt=1.25 > target(1.0), so
+                                        # the very first cycle already
+                                        # clamps to the full target
+                                        # regardless of the stalled
+                                        # feedback base -- skips the
+                                        # incremental-ramp trap entirely.
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.1
-      trans_stopped_velocity: 0.02    # scaled way down from 0.25 --
-                                        # that default is ABOVE this
-                                        # robot's real max speed (0.2),
-                                        # which would make it register as
-                                        # "stopped" at all times
-      short_circuit_trajectory_evaluation: True
-      stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
-      PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.05
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.05
-      PathDist.scale: 32.0
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      use_rotate_to_heading: True
+      rotate_to_heading_min_angle: 0.785   # RPP default (~45deg) --
+                                        # not yet live-tuned for this
+                                        # robot, revisit if it rotates
+                                        # more/less often than expected
+      allow_reversing: False
+      lookahead_dist: 0.3             # first-pass value scaled to this
+                                        # ~5.5x6.5m world, not yet live-
+                                        # tuned
+      min_lookahead_dist: 0.15
+      max_lookahead_dist: 0.4
+      lookahead_time: 1.5
+      use_velocity_scaled_lookahead_dist: False
+      min_approach_linear_velocity: 0.03   # scaled down from RPP's 0.05
+                                        # default in proportion to this
+                                        # robot's lower desired_linear_vel
+      approach_velocity_scaling_dist: 0.3
+      use_collision_detection: True
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: True
+      use_cost_regulated_linear_velocity_scaling: False
+      regulated_linear_scaling_min_radius: 0.5
+      regulated_linear_scaling_min_speed: 0.05
+      use_fixed_curvature_lookahead: False
+      use_interpolation: True
+      max_robot_pose_search_dist: 3.0 # matches SCAN_MAX_RANGE
 
 # No static_layer/map_server -- this robot has no prebuilt map, only
 # live sensing (the /scan topic synthesized from the 4 corner depth
@@ -225,7 +251,39 @@ global_costmap:
       global_frame: odom
       robot_base_frame: base_link
       use_sim_time: True
-      robot_radius: 0.168
+      # Session 15: was 0.168 (bare chassis, hypot(0.15,0.075)) -- but
+      # planner_server is ONLY ever invoked by rotate_drive_controller.py's
+      # carrying-aware /goal_pose_carry_planned leg in the current
+      # shelf_transfer_task.py design (the plain /goal_pose/
+      # /goal_pose_approach topics exist but are unused). A bare-chassis
+      # robot_radius here meant NavfnPlanner could legitimately return
+      # low-cost paths passing as close as ~0.168-0.25m from an obstacle --
+      # well inside rotate_drive_controller.py's own carrying-aware
+      # CARRY_OBSTACLE_STOP_RANGE (chassis radius + cargo half-diagonal,
+      # ~0.3696m). Every such path re-triggered the controller's reactive
+      # stop almost immediately, producing a 3200+ replan-cycle thrash
+      # against a live test (see isaac_robot.md Session 15).
+      #
+      # First fix attempt set this to 0.37, matching CARRY_OBSTACLE_STOP_RANGE
+      # exactly -- live-tested and wrong: the instant the controller's
+      # reactive check stops the robot, the robot's own center sits right on
+      # the planner's lethal-footprint boundary, so NavfnPlanner can't find
+      # any valid path starting from where the robot already is ("failed to
+      # create plan with tolerance 0.20", confirmed live).
+      # Second attempt used 0.30 (0.07m margin below CARRY_OBSTACLE_STOP_RANGE
+      # ~0.3696) -- still failed the same way. Root cause, confirmed live via
+      # real ground-truth position query at the exact stall: the controller's
+      # /scan-based stop distance (a single ray's raw depth, "0.35m") does
+      # NOT equal the true geometric gap to the obstacle's nearest edge --
+      # measured directly, chassis was only 0.287m from Cube_03's real top
+      # edge at the moment /scan reported "0.35m". A single depth-camera ray
+      # sampling a corner/edge at an angle doesn't measure the true nearest-
+      # point distance the costmap's occupied cells are built from. 0.07m of
+      # margin wasn't enough to absorb that ~0.06m sensing/geometry gap.
+      # Widened margin substantially (0.37 -> 0.20, ~0.17m below
+      # CARRY_OBSTACLE_STOP_RANGE) to comfortably survive this class of
+      # discrepancy, not just this one measured instance of it.
+      robot_radius: 0.20
       resolution: 0.1                  # matches CELL_SIZE used
                                          # throughout the rest of this
                                          # project's occupancy grid work
@@ -250,7 +308,14 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.25
+        # Session 15: kept comfortably PAST CARRY_OBSTACLE_STOP_RANGE
+        # (~0.3696m, see robot_radius comment above) so the cost gradient
+        # still discourages routes that would come close enough to
+        # re-trigger the controller's reactive stop -- robot_radius itself
+        # was deliberately pulled back BELOW that threshold instead (for
+        # start-pose validity), so this is what actually keeps planned
+        # paths biased away from the danger zone.
+        inflation_radius: 0.5
       always_send_full_costmap: True
 
 planner_server:
@@ -322,8 +387,17 @@ velocity_smoother:
     feedback: "OPEN_LOOP"
     max_velocity: [0.15, 0.0, 1.0]
     min_velocity: [-0.15, 0.0, -1.0]
-    max_accel: [0.3, 0.0, 1.5]
-    max_decel: [-0.3, 0.0, -1.5]
+    max_accel: [0.3, 0.0, 25.0]       # angular term raised to match
+                                        # FollowPath.max_angular_accel --
+                                        # this node is OPEN_LOOP (uses its
+                                        # own last output, not real odom,
+                                        # so it doesn't hit the same
+                                        # stuck-feedback deadlock RPP did),
+                                        # but a lower cap here would just
+                                        # re-throttle RPP's bigger step
+                                        # right back down before it ever
+                                        # reached the wheels
+    max_decel: [-0.3, 0.0, -25.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
