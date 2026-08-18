@@ -42,6 +42,12 @@ DIAG_FILE = "/tmp/robot1_diag"
 DIAG_RESPONSE_FILE = "/tmp/robot1_diag_response"
 SCENE_DUMP_FILE = "/tmp/robot1_scene_dump"
 SCENE_DUMP_RESPONSE_FILE = "/tmp/robot1_scene_dump_response"
+# Debug-vis: this node has no direct USD access either (same constraint
+# as rotate_drive_controller.py), so the exit/staging/entry points this
+# script computes are handed over via a polled control file. One
+# "label,odom_x,odom_y" per line, rewritten in full each time a new
+# point is known -- the bridge converts to world and draws markers.
+DEBUG_MARKERS_FILE = "/tmp/robot1_debug_markers"
 
 QUERY_TIMEOUT = 5.0
 STATUS_TIMEOUT = 300.0  # generous -- this session's sim has run well
@@ -179,6 +185,7 @@ class ShelfTransferTask(Node):
         self.nav_status = None
         self.chassis_yaw = 0.0
         self.have_chassis_yaw = False
+        self._debug_markers = {}  # debug-vis: label -> (odom_x, odom_y), accumulated over the run
 
         status_qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
                                  durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
@@ -200,6 +207,17 @@ class ShelfTransferTask(Node):
         q = msg.pose.pose.orientation
         self.chassis_yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         self.have_chassis_yaw = True
+
+    def _write_debug_marker(self, label, x, y):
+        # Best-effort only -- a failure here must never abort the actual
+        # task, per direct instruction.
+        try:
+            self._debug_markers[label] = (x, y)
+            with open(DEBUG_MARKERS_FILE, "w") as f:
+                for lbl, (mx, my) in self._debug_markers.items():
+                    f.write(f"{lbl},{mx},{my}\n")
+        except Exception as e:
+            self.get_logger().warn(f"debug-vis marker write failed ({e}) -- continuing")
 
     def set_yaw_compensation(self, enabled: bool):
         with open(YAW_COMPENSATION_CONTROL_FILE, "w") as f:
@@ -406,6 +424,7 @@ class ShelfTransferTask(Node):
         # rotation, just more of the same straight line.
         direction = 1.0 if shelf2_y > obj_y else -1.0
         clear_x, clear_y = obj_x, obj_y + direction * EXIT_CLEARANCE_DISTANCE
+        self._write_debug_marker("shelf1_exit", clear_x, clear_y)
         # mode="carry_clear", not "direct" -- turns while carrying use
         # CARRY_ANGULAR_SPEED (slower) so the plate's counter-rotation
         # (a real position-target joint, not instantaneous) can actually
@@ -450,6 +469,7 @@ class ShelfTransferTask(Node):
         # instead of continuously fighting to keep up mid-transit.
         self.set_yaw_compensation(False)
         staging_y = shelf2_y - direction * ENTRY_CLEARANCE_DISTANCE
+        self._write_debug_marker("shelf2_staging", obj_x, staging_y)
         self.get_logger().info(f"carrying to shelf 2 staging point ({obj_x:.3f}, {staging_y:.3f}) -- collision avoidance active, yaw compensation suspended...")
         reached_staging = self.send_goal_and_wait(obj_x, staging_y, mode="carry_planned")
         if not reached_staging:
@@ -490,6 +510,7 @@ class ShelfTransferTask(Node):
         # Final entry into shelf 2: obstacle check off again, same reasoning
         # as the exit-clearance leg -- the destination is right next to
         # shelf 2's own structure by design.
+        self._write_debug_marker("shelf2_entry", obj_x, shelf2_y)
         self.get_logger().info(f"entering shelf 2, dropping off at ({obj_x:.3f}, {shelf2_y:.3f})...")
         if not self.send_goal_and_wait(obj_x, shelf2_y, mode="carry_clear"):
             self.get_logger().error("never reached shelf 2 -- aborting (still holding object up)")

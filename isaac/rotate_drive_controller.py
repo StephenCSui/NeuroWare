@@ -142,6 +142,14 @@ GOAL_STOP_DIST = 0.01      # arrival tolerance for the final goal -- was
                             # dead-zone problem); whether 0.01m is actually
                             # achievable at the current approach speed needs
                             # live verification, not assumed.
+# Debug-vis: this node has no direct USD access (plain rclpy node, same
+# constraint as everything else in this project -- see
+# nav2_bridge_robot1.py's docstring), so the live waypoint list is handed
+# over via a polled control file, same pattern as every other
+# cross-process hookup here. One "x,y" ODOM-frame pair per line; the
+# bridge converts to world and draws markers.
+DEBUG_WAYPOINTS_FILE = "/tmp/robot1_debug_waypoints"
+
 CONTROL_HZ = 20.0
 OBSTACLE_STOP_RANGE = 0.25 # meters -- hard safety stop while not carrying,
                             # matches local_costmap's inflation_radius
@@ -288,6 +296,7 @@ class RotateDriveController(Node):
 
         self.goal_xy = None
         self.waypoints = []
+        self._last_written_waypoints = None  # debug-vis: avoid rewriting the file when unchanged
         self.state = "IDLE"  # IDLE | TURN | DRIVE | BACKOFF
         self.leg_start_time = None
         self.leg_start_yaw = None
@@ -694,7 +703,20 @@ class RotateDriveController(Node):
     def _stop(self):
         self.cmd_pub.publish(Twist())
 
+    def _write_debug_waypoints(self):
+        # Best-effort only -- a failure here must never interrupt real
+        # navigation, per direct instruction.
+        try:
+            if self.waypoints != self._last_written_waypoints:
+                self._last_written_waypoints = list(self.waypoints)
+                with open(DEBUG_WAYPOINTS_FILE, "w") as f:
+                    for x, y in self.waypoints:
+                        f.write(f"{x},{y}\n")
+        except Exception as e:
+            self.get_logger().warn(f"debug-vis waypoint write failed ({e}) -- continuing")
+
     def _control_tick(self):
+        self._write_debug_waypoints()
         if not self.have_odom or self.state == "IDLE" or not self.waypoints:
             return
 

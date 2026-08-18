@@ -62,6 +62,8 @@ from omni.physx import get_physx_scene_query_interface
 from isaacsim.sensors.camera import Camera
 from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics, Gf
 
+import debug_viz
+
 carb.settings.get_settings().set("/app/viewport/grid/enabled", False)
 
 # Enable the ROS2 bridge BEFORE the graph is built -- matches every real
@@ -78,6 +80,12 @@ simulation_app.update()
 USD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test", "two_robot_two_shelf.usd")
 success, stage = stage_utils.open_stage(USD_PATH)
 print(f"[nav2 bridge robot1] opened {USD_PATH} -> {success}")
+
+# Clear any leftover debug-vis prims (e.g. baked in by a stray GUI save)
+# before rebuilding fresh -- same defensive pattern as GRAPH_PATH below,
+# after the stale-OmniGraph-node crash this project hit once already.
+debug_viz.clear_debug_vis(stage)
+debug_viz.init_debug_vis(stage)
 
 for _ in range(5):
     simulation_app.update()
@@ -262,6 +270,22 @@ LASER_NUM_SAMPLES = 128          # 4 cameras x 32 columns each -- same
 LASER_ANGLE_MIN = -math.pi
 LASER_ANGLE_MAX = math.pi
 LASER_ANGLE_INC = (LASER_ANGLE_MAX - LASER_ANGLE_MIN) / LASER_NUM_SAMPLES
+
+# Debug-vis: one FOV cone per corner camera, drawn as a child of the
+# camera prim itself so it inherits the camera's own local
+# position/orientation for free (cameras are static relative to
+# base_link, never need per-tick updates). Toggle at
+# /World/Robot/Geometry/base_link/DepthCamera_*/FOVCone in the Stage
+# hierarchy, independent of the shared DEBUG_VIS_ROOT group (this is the
+# one indicator category that lives outside it, since true USD parenting
+# under the camera is what makes it follow for free -- see debug_viz.py).
+for _suffix, _pos, _yaw in CAMERA_CORNERS:
+    try:
+        debug_viz.create_camera_fov_cone(
+            stage, f"{ROBOT_PATH}/DepthCamera_{_suffix}",
+            fov_deg=SCAN_HORIZONTAL_FOV_DEG, range_m=SCAN_MAX_RANGE, forward_axis="X")
+    except Exception as _e:
+        print(f"[nav2 bridge robot1] WARNING: FOV cone for DepthCamera_{_suffix} failed ({_e}) -- continuing")
 
 def _sample_camera_range(cam, local_angle_in_cam_frame):
     """local_angle_in_cam_frame: angle relative to the camera's OWN
@@ -710,6 +734,36 @@ def _aabb_overlap(cx, cy, half_x, half_y, bbox):
 DIAG_FILE = "/tmp/robot1_diag"
 DIAG_RESPONSE_FILE = "/tmp/robot1_diag_response"
 
+# Debug-vis: waypoint markers and exit/entry markers are computed by
+# rotate_drive_controller.py / shelf_transfer_task.py (plain rclpy nodes,
+# no direct USD access -- same constraint as every other cross-process
+# hookup in this file), so they're handed over via polled control files,
+# same pattern as everything else above. Both are ODOM-frame points, one
+# per line: waypoints as "x,y", markers as "label,x,y" -- converted to
+# world via the same chassis_yaw0/_spawn_x/_spawn_y rotation
+# spawn_marker_at_odom_goal already uses. Only redrawn when the file's
+# actual content changes, not every tick.
+DEBUG_WAYPOINTS_FILE = "/tmp/robot1_debug_waypoints"
+DEBUG_MARKERS_FILE = "/tmp/robot1_debug_markers"
+_last_debug_waypoints_content = None
+_last_debug_markers_content = None
+
+def _odom_to_world(odom_x, odom_y):
+    c, s = math.cos(chassis_yaw0), math.sin(chassis_yaw0)
+    return (_spawn_x + odom_x * c - odom_y * s,
+            _spawn_y + odom_x * s + odom_y * c)
+
+# Debug-vis: reactive stop-range circle, mirrors
+# rotate_drive_controller.py's OBSTACLE_STOP_RANGE/CARRY_OBSTACLE_STOP_RANGE
+# exactly (duplicated here, not imported -- that script runs as a plain
+# rclpy node under system python3, this one runs inside Isaac's Kit
+# python.sh, different environments/processes entirely, same constraint
+# as every other cross-process constant in this project). Keep in sync
+# by hand if either changes.
+STOP_RANGE_EMPTY = 0.25
+STOP_RANGE_CARRYING = 0.36932  # CHASSIS_RADIUS(hypot(0.15,0.075)) + CARGO_HALF_EXTENTS hypot(0.1001,0.1750)
+_stop_range_carrying_state = None  # None = not drawn yet; tracks last-drawn state to avoid redrawing every tick
+
 while simulation_app.is_running():
     now = time.perf_counter()
     dt = now - last_time
@@ -1033,6 +1087,49 @@ while simulation_app.is_running():
             print(f"[nav2 bridge robot1] WARNING: get_dof_positions failed this tick ({_e}) -- skipping manual_yaw_target resync", flush=True)
 
     og.Controller.set(_scan_data_attr, synthesize_laser_ranges(depth_cams1))
+
+    # Debug-vis update -- entirely best-effort. Any single failure here
+    # (a missing prim, a malformed control-file line, whatever) just logs
+    # a warning and moves on; it must never be able to take down the rest
+    # of this tick, since none of it is load-bearing for the actual task.
+    try:
+        if os.path.exists(DEBUG_WAYPOINTS_FILE):
+            with open(DEBUG_WAYPOINTS_FILE) as f:
+                _wp_content = f.read()
+            if _wp_content != _last_debug_waypoints_content:
+                _last_debug_waypoints_content = _wp_content
+                _wp_world = []
+                for _line in _wp_content.splitlines():
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    _ox, _oy = (float(_v) for _v in _line.split(","))
+                    _wp_world.append(_odom_to_world(_ox, _oy))
+                debug_viz.draw_waypoints(stage, _wp_world)
+
+        if os.path.exists(DEBUG_MARKERS_FILE):
+            with open(DEBUG_MARKERS_FILE) as f:
+                _mk_content = f.read()
+            if _mk_content != _last_debug_markers_content:
+                _last_debug_markers_content = _mk_content
+                _mk_world = {}
+                for _line in _mk_content.splitlines():
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    _label, _ox, _oy = _line.split(",")
+                    _mk_world[_label] = _odom_to_world(float(_ox), float(_oy))
+                debug_viz.draw_exit_entry_markers(stage, _mk_world)
+
+        _cx, _cy, _ = get_xy_yaw(robot)
+        _now_carrying = carrying_path is not None
+        if _now_carrying != _stop_range_carrying_state:
+            _stop_range_carrying_state = _now_carrying
+            _radius = STOP_RANGE_CARRYING if _now_carrying else STOP_RANGE_EMPTY
+            debug_viz.create_stop_range_circle(stage, _radius)
+        debug_viz.move_prim_to(stage, f"{debug_viz.DEBUG_VIS_ROOT}/StopRange/ring", _cx, _cy)
+    except Exception as _e:
+        print(f"[nav2 bridge robot1] WARNING: debug-vis update failed this tick ({_e}) -- continuing", flush=True)
 
     simulation_app.update()
     _tick_count += 1
