@@ -153,3 +153,21 @@ Full ground-truth geometry for `two_robot_two_shelf.usd`'s shelf structure and s
 
 ### Planned future work: dedicated camera-calibration world (not started)
 Per direct discussion (2026-08-15): a new, **separate** USD world (not `two_robot_two_shelf.usd`) purpose-built to calibrate the 4 corner depth cameras properly — a true LiDAR mounted at the robot's center as ground truth, with a deliberately varied set of reference objects for it to measure against. Goal: characterize whether the depth-camera sensor bias found earlier this project (~0.06m undermeasurement, measured exactly once, at one specific approach angle/geometry) is a consistent, predictable offset or actually varies by angle/geometry — currently unknown either way. Open design question for whoever builds this: whether the reference LiDAR should sample a single fixed height or scan across multiple heights, since the existing corner cameras are already known to behave as an effectively-2D, fixed-height sample of a 3D scene (`CAMERA_HEIGHT=0.10`, confirmed this project doesn't otherwise use — see `isaac_robot.md`). Deprioritized behind the visual-indicators and path-planning work (see `isaac_robot.md` Session 16 "Planned next work" for the agreed order).
+
+---
+
+## Session 17 (continued) — NeuroWare (2026-08-18)
+
+### What was done
+Built the dedicated camera-calibration world planned above — `isaac/test/build_camera_calibration_world.py` produces `isaac/test/camera_calibration.usd`: a stripped-down copy of `two_robot_two_shelf.usd` (ground plane, lights, physics scene, and the robot only — shelves/second robot/payloads removed) plus 4 reference objects (a flat wall, a corner/edge target, a cylinder, a thin post) placed at precisely computed bearings/distances from the robot's real queried pose, recorded alongside in `camera_calibration_reference.json` for provenance. Went through two geometry revisions this session: the corner-edge target was originally built from two thin offset planks meeting at 90°, one of which turned out to present an almost edge-on, near-zero cross-section to the camera from certain approach angles (confirmed via a raycast that found no hit at all despite the object's bounding box appearing to cover the tested ray) — replaced with a single solid cube yawed 45° instead, still non-flat but with real cross-section from any angle.
+
+The reference LiDAR mentioned in the original plan above was tried, but abandoned in favor of direct PhysX raycasting once real, run-to-run-inconsistent behavior showed up even after fixing every bug found in it — see `isaac_robot.md` Session 17 (continued) for the full account. The single-height-vs-multi-height open question above is now moot: ranging in production no longer goes through any camera or LiDAR sensor abstraction at all, just a direct raycast fan from the robot's live pose.
+
+### Current state
+`isaac/test/camera_calibration.usd` and its builder script are real, committed, reusable assets — running the builder again reproduces the same world from the current `two_robot_two_shelf.usd` robot state, so it isn't a one-off hand-built file. `logs/camera_calibration_results.csv` holds the latest validated run's numbers (all 4 targets within 0.0001m of ground truth).
+
+### Dependencies
+- `build_camera_calibration_world.py` copies the robot's LIVE pose/geometry from `two_robot_two_shelf.usd` at build time — if the main scene's robot spawn position or asset changes, the calibration world needs rebuilding to match, not assumed still valid.
+
+### [WORTH EXPLORING]
+- The calibration world currently has 4 reference objects at 4 fixed bearings/distances, chosen to exercise specific known failure modes found this session (a camera-FOV seam, a close/thin target, etc.). If sensing is revisited again in the future, it's worth adding more/denser reference points for a fuller angular sweep rather than reusing just these 4 spot-checks.
