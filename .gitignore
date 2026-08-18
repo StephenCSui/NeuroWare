@@ -3,7 +3,7 @@ gitignore/
 
 # Diagnostic depth-camera frame dumps (auto-generated, auto-pruned to
 # the last few runs by two_robot_pickup_demo.py -- not source)
-isaac/depth_frames/
+isaac/legacy/depth_frames/
 
 # Claude session data
 .claude/

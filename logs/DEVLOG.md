@@ -720,3 +720,23 @@ The transfer task completes reliably enough to call this a real milestone, but n
 4. Fix the backoff mechanism's retreat-direction unreliability (still unresolved, just exercised less often now).
 5. Decide what to do with `simulation/models/`/`simulation/reward_logs/` (separate from this session's work, currently untracked and uncommitted).
 6. Carried over: `sudo dmesg` after a future crash, phase-two friction-based holding, the pygame transport-negotiation port, RL decision layer, un-version-controlled robot asset fixes.
+
+---
+
+## Session 17 — NeuroWare (2026-08-18)
+
+### What was done
+General working-tree cleanup on the `transport` branch, no code/logic changes.
+
+- **Resolved the Session 16 `simulation/models`/`simulation/reward_logs` disposition item.** These were untracked leftovers from the earlier farm-swarm RL work, not the transport project — confirmed by checking the `farm` branch's own history: `simulation/models/task_policy.pkl` (181MB, dated 2026-07-19) is the trained RandomForest-FQI task-prioritization policy produced by `simulation/train.py`, and `simulation/reward_logs/reward_log.csv`+`death_log.csv` are that training run's per-tick reward and death-cause logs (agents monitoring/watering/weeding/harvesting a 6-cell grid, with death/dehydration reward shaping). The actual implementation (`train.py`, `rl_policy.py`, `reward_log.py`, `death_log.py`) lives only on the `farm` branch, committed there in `f7eb894` ("Pivot to autonomous farm swarm... ship an RL task-prioritization layer") and `968312e` ("Fix swap deadlock, rewrite RL policy on RandomForest FQI, and add death/dehydration reward shaping") — that history is untouched and remains the real record of this work. The `transport` branch's `simulation/` never had `train.py` at all, so these were just stray output artifacts sitting on disk from an earlier checkout, tracked nowhere. Per direct instruction, deleted both directories now that their origin and findings are recorded here — nothing tracked was lost.
+- **Committed the remaining archived-but-uncommitted `isaac/legacy/` files**, matching the "archive, don't delete" treatment Session 15 already applied to the rest of that directory: `_diag_ros2_interop.py`, `_open_robot1_cube03_world.py`, `_vis_state.npz`.
+- **Deleted stale `.usd.bak_*` snapshots** — timestamped revert-points from live GUI edits, superseded now that the corresponding current files are confirmed working and already committed: three under `isaac/test/` (2026-08-15) and one under `isaac/legacy/test/` (2026-08-13).
+- **Deleted `isaac/legacy/depth_frames/`** (472K of auto-generated diagnostic PNGs from old runs, not source) and fixed the matching `.gitignore` rule (`isaac/depth_frames/` → `isaac/legacy/depth_frames/`), stale since Session 15 moved the diagnostic scripts that generate it into `legacy/`.
+- Deleted `__pycache__/` dirs under `isaac/`, `simulation/`, `transport/` (already gitignored, pure bytecode cache).
+
+### Current state
+Working tree is clean of stray/untracked cruft on the `transport` branch. No functional code changed.
+
+### Next steps (high level)
+1. Resume the agreed Session 16 future-work order: (1) toggleable visual debug indicators, (2) live plan visualization + fewer waypoints, (3) camera calibration world.
+2. Carried over: shelf-1 exit soft-cost-zone clearance, backoff retreat-direction unreliability, the unconfirmed "270° turn" anomaly, `sudo dmesg` after a future crash, phase-two friction-based holding, the pygame transport-negotiation port, RL decision layer, un-version-controlled robot asset fixes, `nav2_params_robot1.yaml`'s ~250 dead config lines from the pre-Session-13 architecture (not trimmed).
