@@ -59,10 +59,10 @@ from omni.kit.viewport.utility import get_active_viewport, frame_viewport_prims
 import isaacsim.core.experimental.utils.stage as stage_utils
 from isaacsim.core.experimental.prims import Articulation, RigidPrim
 from omni.physx import get_physx_scene_query_interface
-from isaacsim.sensors.camera import Camera
 from pxr import PhysxSchema, Usd, UsdGeom, UsdPhysics, Gf
 
 import debug_viz
+import depth_cameras
 
 carb.settings.get_settings().set("/app/viewport/grid/enabled", False)
 
@@ -209,168 +209,11 @@ carrying_offset = None  # (dx, dy, dz) from chassis at the moment it was
                         # confirmed live this session: a real fall-off
                         # went undetected by a Z-only check.
 
-# Same 4-corner depth camera layout as robot1_cube03_live_test.py -- kept
-# for later LaserScan publishing (task #19), unused by the graph so far.
-CAMERA_HEIGHT = 0.10
-CAMERA_CORNERS = [
-    ("FL", np.array([0.15, 0.075, CAMERA_HEIGHT]), 45.0),
-    ("FR", np.array([0.15, -0.075, CAMERA_HEIGHT]), -45.0),
-    ("RL", np.array([-0.15, 0.075, CAMERA_HEIGHT]), 135.0),
-    ("RR", np.array([-0.15, -0.075, CAMERA_HEIGHT]), -135.0),
-]
-
-def _yaw_quat(deg):
-    half = math.radians(deg) / 2.0
-    return np.array([math.cos(half), 0.0, 0.0, math.sin(half)])
-
-def add_depth_camera(base_link_path, name, translation, orientation):
-    cam = Camera(
-        prim_path=f"{base_link_path}/{name}",
-        translation=translation,
-        orientation=orientation,
-        frequency=20,
-        resolution=(128, 128),
-    )
-    cam.initialize()
-    cam.set_clipping_range(near_distance=0.02, far_distance=50.0)
-    cam.set_focal_length(10.5)
-    cam.add_distance_to_camera_to_frame()
-    for _ in range(30):
-        simulation_app.update()
-    return cam
-
-def add_corner_cameras(base_link_path):
-    return [
-        add_depth_camera(base_link_path, f"DepthCamera_{suffix}", pos, _yaw_quat(yaw))
-        for suffix, pos, yaw in CAMERA_CORNERS
-    ]
-
-depth_cams1 = add_corner_cameras(ROBOT_PATH)
-
-def raw_depth_frame(cam):
-    frame = cam.get_current_frame()
-    return frame.get("distance_to_camera") if frame else None
-
-# LaserScan synthesis -- reuses the exact same per-camera ray-angle
-# geometry as occupancy_grid.py's update_from_camera (same FOV, same
-# near-center row band), just reorganized into a uniform 360-degree scan
-# for ROS2PublishLaserScan's plain `linearDepthData: float[]` input,
-# which is fully decoupled from needing an actual RTX Lidar sensor --
-# confirmed via its .ogn definition. This stays entirely on the
-# OmniGraph/Kit side (og.Controller.set, not rclpy), so it doesn't touch
-# the broken Python/ROS2 boundary at all.
-SCAN_HORIZONTAL_FOV_DEG = 90.0  # matches set_focal_length(10.5) above
-SCAN_ROW_HALF_BAND = 1          # near-single-row sample, see
-                                  # occupancy_grid.py's own comment for
-                                  # why a wider band produces phantom hits
-SCAN_MAX_RANGE = 3.0             # matches DEPTH_VIS_MAX/MAX_RANGE used
-                                  # elsewhere this session for this robot
-LASER_NUM_SAMPLES = 128          # 4 cameras x 32 columns each -- same
-                                  # resolution occupancy_grid.py samples
-LASER_ANGLE_MIN = -math.pi
-LASER_ANGLE_MAX = math.pi
-LASER_ANGLE_INC = (LASER_ANGLE_MAX - LASER_ANGLE_MIN) / LASER_NUM_SAMPLES
-
-# Debug-vis: one FOV cone per corner camera, drawn as a child of the
-# camera prim itself so it inherits the camera's own local
-# position/orientation for free (cameras are static relative to
-# base_link, never need per-tick updates). Toggle at
-# /World/Robot/Geometry/base_link/DepthCamera_*/FOVCone in the Stage
-# hierarchy, independent of the shared DEBUG_VIS_ROOT group (this is the
-# one indicator category that lives outside it, since true USD parenting
-# under the camera is what makes it follow for free -- see debug_viz.py).
-for _suffix, _pos, _yaw in CAMERA_CORNERS:
-    try:
-        debug_viz.create_camera_fov_cone(
-            stage, f"{ROBOT_PATH}/DepthCamera_{_suffix}",
-            fov_deg=SCAN_HORIZONTAL_FOV_DEG, range_m=SCAN_MAX_RANGE, forward_axis="X")
-    except Exception as _e:
-        print(f"[nav2 bridge robot1] WARNING: FOV cone for DepthCamera_{_suffix} failed ({_e}) -- continuing")
-
-def _sample_camera_range(cam, local_angle_in_cam_frame):
-    """local_angle_in_cam_frame: angle relative to the camera's OWN
-    forward direction. Returns the range at that angle from the camera's
-    current depth frame, or None if the angle is outside this camera's
-    FOV (caller tries the next camera), or SCAN_MAX_RANGE if in-FOV but
-    nothing finite was seen."""
-    half_fov = math.radians(SCAN_HORIZONTAL_FOV_DEG) / 2.0
-    if abs(local_angle_in_cam_frame) > half_fov:
-        return None
-    frame = raw_depth_frame(cam)
-    if frame is None:
-        return SCAN_MAX_RANGE
-    h, w = frame.shape
-    row_center = h // 2
-    row_lo = max(0, row_center - SCAN_ROW_HALF_BAND)
-    row_hi = min(h, row_center + SCAN_ROW_HALF_BAND + 1)
-    c = int(round(((local_angle_in_cam_frame / half_fov) / 2.0 + 0.5) * (w - 1)))
-    c = max(0, min(w - 1, c))
-    col_vals = frame[row_lo:row_hi, c]
-    finite = col_vals[np.isfinite(col_vals)]
-    return min(float(finite.min()), SCAN_MAX_RANGE) if finite.size else SCAN_MAX_RANGE
-
-CAMERA_OVERLAP_RECONCILE_TOL = 0.1  # meters -- the 4 corner cameras are
-                                  # separate physical viewpoints, so where
-                                  # their 90deg FOVs overlap they see the
-                                  # same real surface at different parallax,
-                                  # not a genuine disagreement. If two
-                                  # cameras' readings at the same body-frame
-                                  # angle are within this of each other,
-                                  # average them into one consistent value
-                                  # instead of the old naive min() (which
-                                  # could flip abruptly between cameras
-                                  # sample to sample at the seam, producing
-                                  # a jagged boundary for one real smooth
-                                  # surface -- "layering" that fed spurious
-                                  # occupied cells into the costmap/planner).
-                                  # A genuine disagreement beyond this
-                                  # tolerance (e.g. one camera sees past an
-                                  # edge the other can't) still keeps the
-                                  # closer/more conservative reading.
-SMOOTH_MEDIAN_WINDOW = 3         # odd window (samples either side of each
-                                  # angle) -- knocks out single-sample
-                                  # seam/edge-grazing noise spikes before
-                                  # they reach the costmap.
-
-def _median_smooth(values, window):
-    """Circular median filter -- this is a full 360deg scan, so angle
-    index 0 and index -1 are physically adjacent, not a hard edge."""
-    half = window // 2
-    n = len(values)
-    out = []
-    for i in range(n):
-        neighborhood = sorted(values[(i + k) % n] for k in range(-half, half + 1))
-        out.append(neighborhood[len(neighborhood) // 2])
-    return out
-
-def synthesize_laser_ranges(cams):
-    """One range per fixed robot-frame angle (LASER_NUM_SAMPLES evenly
-    spaced from -pi to pi, matching ROS2PublishLaserScan's azimuthRange
-    [-180,180]). Where more than one corner camera's FOV covers a given
-    direction, reconciles their readings (see CAMERA_OVERLAP_RECONCILE_TOL)
-    instead of naively taking whichever is smaller. Returned in increasing-
-    azimuth order, as the node requires."""
-    ranges = []
-    for i in range(LASER_NUM_SAMPLES):
-        angle = LASER_ANGLE_MIN + i * LASER_ANGLE_INC
-        hits = []
-        for cam, (_, _, cam_yaw_deg) in zip(cams, CAMERA_CORNERS):
-            local_angle = angle - math.radians(cam_yaw_deg)
-            local_angle = math.atan2(math.sin(local_angle), math.cos(local_angle))
-            r = _sample_camera_range(cam, local_angle)
-            if r is not None:
-                hits.append(r)
-        if not hits:
-            ranges.append(SCAN_MAX_RANGE)
-        elif len(hits) == 1:
-            ranges.append(hits[0])
-        else:
-            lo, hi = min(hits), max(hits)
-            if hi - lo <= CAMERA_OVERLAP_RECONCILE_TOL:
-                ranges.append(sum(hits) / len(hits))
-            else:
-                ranges.append(lo)
-    return _median_smooth(ranges, SMOOTH_MEDIAN_WINDOW)
+# Camera rig + LaserScan synthesis extracted to depth_cameras.py so the
+# camera-calibration script (planned future work) measures the exact
+# same setup used here, not a re-implemented approximation. FOV cones
+# are drawn as part of add_camera_rig itself now (stage= passed in).
+depth_cams1 = depth_cameras.add_camera_rig(ROBOT_PATH, simulation_app, stage=stage)
 
 def get_xy_yaw(r):
     pos, quat = r.get_world_poses()
@@ -538,11 +381,11 @@ def build_ros2_graph():
                 ("PublishScan.inputs:frameId", "base_link"),
                 ("PublishScan.inputs:topicName", "scan"),
                 ("PublishScan.inputs:horizontalFov", 360.0),
-                ("PublishScan.inputs:horizontalResolution", 360.0 / LASER_NUM_SAMPLES),
-                ("PublishScan.inputs:depthRange", [0.02, SCAN_MAX_RANGE]),
+                ("PublishScan.inputs:horizontalResolution", 360.0 / depth_cameras.LASER_NUM_SAMPLES),
+                ("PublishScan.inputs:depthRange", [0.02, depth_cameras.SCAN_MAX_RANGE]),
                 ("PublishScan.inputs:azimuthRange", [-180.0, 180.0]),
                 ("PublishScan.inputs:numRows", 1),
-                ("PublishScan.inputs:numCols", LASER_NUM_SAMPLES),
+                ("PublishScan.inputs:numCols", depth_cameras.LASER_NUM_SAMPLES),
                 ("PublishClock.inputs:topicName", "clock"),
             ],
         },
@@ -1086,7 +929,8 @@ while simulation_app.is_running():
         except AssertionError as _e:
             print(f"[nav2 bridge robot1] WARNING: get_dof_positions failed this tick ({_e}) -- skipping manual_yaw_target resync", flush=True)
 
-    og.Controller.set(_scan_data_attr, synthesize_laser_ranges(depth_cams1))
+    _scan_cx, _scan_cy, _scan_cyaw = get_xy_yaw(robot)
+    og.Controller.set(_scan_data_attr, depth_cameras.synthesize_laser_ranges(_scan_cx, _scan_cy, _scan_cyaw))
 
     # Debug-vis update -- entirely best-effort. Any single failure here
     # (a missing prim, a malformed control-file line, whatever) just logs

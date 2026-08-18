@@ -180,25 +180,34 @@ def move_prim_to(stage, path, x, y, z=0.02):
         print(f"[debug_viz] WARNING: move_prim_to({path}) failed ({e}) -- continuing")
 
 
-def create_camera_fov_cone(stage, camera_prim_path, fov_deg, range_m, forward_axis="X"):
-    """Draws two boundary rays (+ a center ray) from local origin out to
-    `range_m`, splayed at +-fov_deg/2 around local Z, as a CHILD of the
-    camera prim itself so it inherits the camera's own position/
-    orientation for free via normal USD parent-transform inheritance --
-    no separate tracking needed since camera mounts are static relative
-    to their parent. `forward_axis` matches whatever local axis the
-    camera's own depth sampling already treats as forward (this
-    project's cameras use local +X, per nav2_bridge_robot1.py)."""
+def create_camera_fov_cone(stage, parent_path, name, local_pos, local_yaw_deg, fov_deg, range_m):
+    """Draws two boundary rays (+ a center ray) out to `range_m`, splayed
+    at +-fov_deg/2 around the given LOCAL yaw (degrees, same convention
+    as everywhere else in this project -- 0 = parent's local +X,
+    increasing counterclockwise). Lives as a CHILD of `parent_path` (the
+    robot's base_link, not the camera prim itself) with an explicitly
+    authored translate+rotateZ matching the camera's own intended mount
+    pose (`local_pos`, `local_yaw_deg`) -- so it inherits base_link's
+    live world transform for free (moves/turns with the robot) without
+    depending on the camera prim's own stored orientation, which Isaac's
+    Camera class internally remaps to USD's native camera convention
+    (confirmed live: parenting under the camera prim produced a visibly
+    tilted cone -- the sensing itself is unaffected since that goes
+    through Isaac's real frustum/render pipeline, not this raw-axis
+    assumption, but the debug visual was wrong)."""
     try:
-        path = f"{camera_prim_path}/FOVCone"
+        group_path = f"{parent_path}/{name}"
+        group = UsdGeom.Xform.Define(stage, group_path)
+        gxf = UsdGeom.Xformable(group)
+        gxf.AddTranslateOp().Set(Gf.Vec3d(float(local_pos[0]), float(local_pos[1]), float(local_pos[2])))
+        gxf.AddRotateZOp().Set(float(local_yaw_deg))
+
+        path = f"{group_path}/FOVCone"
         curve = UsdGeom.BasisCurves.Define(stage, path)
         half = math.radians(fov_deg) / 2.0
 
         def _ray(angle):
-            if forward_axis == "X":
-                return Gf.Vec3f(range_m * math.cos(angle), range_m * math.sin(angle), 0.0)
-            else:
-                return Gf.Vec3f(range_m * math.sin(angle), range_m * math.cos(angle), 0.0)
+            return Gf.Vec3f(range_m * math.cos(angle), range_m * math.sin(angle), 0.0)
 
         origin = Gf.Vec3f(0.0, 0.0, 0.0)
         pts = [origin, _ray(-half), origin, _ray(half), origin, _ray(0.0)]
@@ -210,5 +219,5 @@ def create_camera_fov_cone(stage, camera_prim_path, fov_deg, range_m, forward_ax
         curve.CreateWidthsAttr([0.005] * len(pts))
         return curve.GetPrim()
     except Exception as e:
-        print(f"[debug_viz] WARNING: create_camera_fov_cone({camera_prim_path}) failed ({e}) -- continuing")
+        print(f"[debug_viz] WARNING: create_camera_fov_cone({parent_path}/{name}) failed ({e}) -- continuing")
         return None

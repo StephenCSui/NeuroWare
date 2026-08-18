@@ -1,0 +1,39 @@
+{
+  "robot_world_x": 2.03988055608992,
+  "robot_world_y": -0.7469999037746363,
+  "robot_world_yaw_deg": -180.0,
+  "objects": [
+    {
+      "label": "wall",
+      "kind": "wall",
+      "bearing_deg_from_robot_forward": 0.0,
+      "true_distance_m": 2.0,
+      "world_x": 0.03988055608992003,
+      "world_y": -0.7469999037746365
+    },
+    {
+      "label": "corner_edge",
+      "kind": "corner_edge",
+      "bearing_deg_from_robot_forward": -45.0,
+      "true_distance_m": 1.5,
+      "world_x": 0.9792203843100986,
+      "world_y": 0.3136602680051849
+    },
+    {
+      "label": "cylinder",
+      "kind": "cylinder",
+      "bearing_deg_from_robot_forward": 45.0,
+      "true_distance_m": 2.5,
+      "world_x": 0.2721136031235514,
+      "world_y": -2.514766856741005
+    },
+    {
+      "label": "thin_post",
+      "kind": "thin_post",
+      "bearing_deg_from_robot_forward": 100.0,
+      "true_distance_m": 1.0,
+      "world_x": 2.2135287337568506,
+      "world_y": -1.7318076567868443
+    }
+  ]
+}
