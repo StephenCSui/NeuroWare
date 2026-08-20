@@ -597,14 +597,18 @@ def _odom_to_world(odom_x, odom_y):
             _spawn_y + odom_x * s + odom_y * c)
 
 # Debug-vis: reactive stop-range circle, mirrors
-# rotate_drive_controller.py's OBSTACLE_STOP_RANGE/CARRY_OBSTACLE_STOP_RANGE
+# rotate_drive_controller.py's OBSTACLE_STOP_RANGE/_required_clearance()
 # exactly (duplicated here, not imported -- that script runs as a plain
 # rclpy node under system python3, this one runs inside Isaac's Kit
 # python.sh, different environments/processes entirely, same constraint
 # as every other cross-process constant in this project). Keep in sync
-# by hand if either changes.
+# by hand if either changes. The carrying radius is no longer a fixed
+# constant -- like rotate_drive_controller.py's real clearance threshold,
+# it's computed from carrying_path's own live bbox (via _touch_bbox_cache,
+# already used below for the Cube_03 touch check), so the circle stays
+# honest for whatever object is actually on the plate, not just /Cube.
 STOP_RANGE_EMPTY = 0.25
-STOP_RANGE_CARRYING = 0.36932  # CHASSIS_RADIUS(hypot(0.15,0.075)) + CARGO_HALF_EXTENTS hypot(0.1001,0.1750)
+CHASSIS_RADIUS = math.hypot(CHASSIS_HALF_X, CHASSIS_HALF_Y)
 _stop_range_carrying_state = None  # None = not drawn yet; tracks last-drawn state to avoid redrawing every tick
 
 while simulation_app.is_running():
@@ -727,7 +731,20 @@ while simulation_app.is_running():
                     _ox0, _oy0 = _to_odom(_mn[0], _mn[1])
                     _ox1, _oy1 = _to_odom(_mx[0], _mx[1])
                     _has_collision = _prim.HasAPI(UsdPhysics.CollisionAPI)
-                    _lines.append(f"{_path} [{_prim.GetTypeName()}] collision={_has_collision} "
+                    # Real, live PhysX-computed mass (not a guess/lookup) --
+                    # only meaningful for an actual rigid body; queried the
+                    # same way carrying_path's world pose already is
+                    # (RigidPrim, live simulation view, not just whatever's
+                    # authored in USD). Used by shelf_transfer_task.py to
+                    # size rotate_drive_controller.py's accel/decel ramp to
+                    # the real carried object's weight.
+                    _mass_str = "n/a"
+                    if _prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                        try:
+                            _mass_str = f"{float(RigidPrim(_path).get_masses().numpy()[0][0]):.4f}"
+                        except Exception:
+                            pass
+                    _lines.append(f"{_path} [{_prim.GetTypeName()}] collision={_has_collision} mass={_mass_str} "
                                   f"world_bbox=({_mn[0]:.3f},{_mn[1]:.3f},{_mn[2]:.3f})-({_mx[0]:.3f},{_mx[1]:.3f},{_mx[2]:.3f}) "
                                   f"odom_bbox=({_ox0:.3f},{_oy0:.3f})-({_ox1:.3f},{_oy1:.3f})")
                 except Exception as _e:
@@ -969,7 +986,14 @@ while simulation_app.is_running():
         _now_carrying = carrying_path is not None
         if _now_carrying != _stop_range_carrying_state:
             _stop_range_carrying_state = _now_carrying
-            _radius = STOP_RANGE_CARRYING if _now_carrying else STOP_RANGE_EMPTY
+            if _now_carrying:
+                _cargo_rng = _touch_bbox_cache.ComputeWorldBound(stage.GetPrimAtPath(carrying_path)).ComputeAlignedRange()
+                _cmn, _cmx = _cargo_rng.GetMin(), _cargo_rng.GetMax()
+                _cargo_half_x = abs(_cmx[0] - _cmn[0]) / 2.0
+                _cargo_half_y = abs(_cmx[1] - _cmn[1]) / 2.0
+                _radius = CHASSIS_RADIUS + math.hypot(_cargo_half_x, _cargo_half_y)
+            else:
+                _radius = STOP_RANGE_EMPTY
             debug_viz.create_stop_range_circle(stage, _radius)
         debug_viz.move_prim_to(stage, f"{debug_viz.DEBUG_VIS_ROOT}/StopRange/ring", _cx, _cy)
     except Exception as _e:

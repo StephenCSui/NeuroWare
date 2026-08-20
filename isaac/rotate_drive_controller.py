@@ -46,7 +46,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav2_msgs.action import ComputePathToPose
 from nav_msgs.msg import Path, Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
@@ -185,8 +185,49 @@ FORWARD_HALF_ANGLE = math.radians(90.0)  # the reactive obstacle check only
 # guessed -- matching two_robot_pickup_demo.py's own OBJECT_HALF_EXTENTS
 # entry for the same prim path almost exactly ((0.1001, 0.1750)).
 CHASSIS_RADIUS = math.hypot(0.15, 0.075)          # real chassis half-extents
-CARGO_HALF_EXTENTS = (0.1001, 0.1750)             # real /Cube half-extents
-CARRY_OBSTACLE_STOP_RANGE = CHASSIS_RADIUS + math.hypot(*CARGO_HALF_EXTENTS)
+DEFAULT_CARGO_HALF_EXTENTS = (0.1001, 0.1750)     # /Cube's real half-extents --
+                             # fallback only. The real clearance threshold
+                             # while carrying is CHASSIS_RADIUS +
+                             # hypot(*self.cargo_half_extents), computed live
+                             # in _required_clearance() from whatever the
+                             # /cargo_extents topic last reported (see
+                             # _cargo_extents_cb) -- shelf_transfer_task.py
+                             # publishes the real bbox half-extents of
+                             # whatever object it's actually carrying before
+                             # starting a carry leg, so this threshold covers
+                             # the real object, not just /Cube. This default
+                             # is only used until the first message arrives
+                             # (e.g. a bare `ros2 topic pub /goal_pose_carry_*`
+                             # test with no publisher running).
+DEFAULT_CARGO_MASS = 9.8   # kg -- /Cube's real mass (legacy demo data),
+                            # fallback only, same reasoning as
+                            # DEFAULT_CARGO_HALF_EXTENTS above -- overwritten
+                            # live by _cargo_extents_cb before every real
+                            # carry leg.
+# Per user's live hypothesis: a real mid-carry cargo drop, seen repeatedly
+# on the exit-shelf-1 leg specifically (the very first movement right after
+# a lift, starting from a dead stop -- unlike mid-route waypoints, which
+# already carry some through-momentum), is plausibly caused by accelerating
+# a LIGHT object too abruptly for friction to keep it seated on the plate,
+# not a fixed property of the leg itself. Untested/unconfirmed -- this is
+# the first thing being tried, not a proven fix. Scales the accel ramp
+# (primary lever, matches the hypothesis directly) and, secondarily, the
+# decel floor, continuously by real live cargo mass -- heavier objects keep
+# today's already-tuned fast profile unchanged, lighter objects get a more
+# gradual start/stop. Reference points are real masses already established
+# this project (legacy demo data): /Cube_02 (2kg, lightest solo-liftable
+# object) and /Cube (9.8kg, the original default payload, where today's
+# existing RAMP_TIME/MIN_RAMP_OUT tuning was proven).
+LIGHT_MASS_REF = 2.0       # kg -- most gradual ramp applies at/below this
+HEAVY_MASS_REF = 9.8       # kg -- today's existing ramp tuning applies
+                            # unchanged at/above this
+RAMP_TIME_LIGHT = 3.5      # seconds -- accel ramp duration for the
+                            # lightest carried objects (vs RAMP_TIME=1.5
+                            # unchanged for heavy)
+MIN_RAMP_OUT_LIGHT = 0.3   # deceleration floor for the lightest carried
+                            # objects (vs MIN_RAMP_OUT=0.85 unchanged for
+                            # heavy) -- matches FINAL_APPROACH_MIN_RAMP_OUT's
+                            # already-proven value, not a new guess
 STALL_TIMEOUT = 8.0        # seconds with no measurable yaw/position change
                             # during a turn/drive before aborting the leg
 
@@ -370,6 +411,13 @@ class RotateDriveController(Node):
         # current_rotation_radius(label) picking its radius from the real
         # `carrying` dict rather than a per-leg-type switch.
         self.carrying = False
+        self.cargo_half_extents = DEFAULT_CARGO_HALF_EXTENTS  # updated live by
+                                   # _cargo_extents_cb, see /cargo_extents sub
+                                   # below and DEFAULT_CARGO_HALF_EXTENTS's comment
+        self.cargo_mass = DEFAULT_CARGO_MASS  # updated live by
+                                   # _cargo_extents_cb -- see DEFAULT_CARGO_MASS's
+                                   # comment, used by _carry_ramp_scale()
+        self.create_subscription(Point, "/cargo_extents", self._cargo_extents_cb, 10)
         self.direct_mode = False  # True for /goal_pose_direct and
                                    # /goal_pose_carry_direct -- no planner
                                    # routing, so an obstacle stop can't
@@ -489,6 +537,30 @@ class RotateDriveController(Node):
             if self.goal_xy:
                 self._request_plan(self.goal_xy)
 
+    def _cargo_extents_cb(self, msg: Point):
+        # (x, y) = real half-extents (meters), z = real mass (kg, 0.0 if the
+        # bridge couldn't determine one -- treated as "no data", not
+        # "massless") of whatever's currently on the plate, published by
+        # shelf_transfer_task.py right after it confirms a lift -- see
+        # DEFAULT_CARGO_HALF_EXTENTS/DEFAULT_CARGO_MASS's comments for why
+        # this exists instead of fixed constants.
+        self.cargo_half_extents = (msg.x, msg.y)
+        if msg.z > 0.0:
+            self.cargo_mass = msg.z
+        self.get_logger().info(f"cargo half-extents updated: ({msg.x:.4f}, {msg.y:.4f}), mass={self.cargo_mass:.3f}kg")
+
+    def _carry_ramp_scale(self):
+        """0.0 (at/above HEAVY_MASS_REF -- today's existing ramp profile,
+        unchanged) .. 1.0 (at/below LIGHT_MASS_REF -- most gradual
+        accel/decel) -- linear interpolation on real live cargo_mass,
+        clamped at both ends. See RAMP_TIME_LIGHT/MIN_RAMP_OUT_LIGHT's
+        comment for why this exists."""
+        span = HEAVY_MASS_REF - LIGHT_MASS_REF
+        if span <= 0:
+            return 0.0
+        t = (HEAVY_MASS_REF - self.cargo_mass) / span
+        return max(0.0, min(1.0, t))
+
     def _goal_cb(self, msg: PoseStamped):
         self.carrying = False
         self.direct_mode = False
@@ -581,8 +653,13 @@ class RotateDriveController(Node):
     def _required_clearance(self):
         """The same threshold _control_tick's reactive check uses -- kept
         as one function so the planner and the reactive check can never
-        drift apart onto two different numbers for the same state."""
-        return CARRY_OBSTACLE_STOP_RANGE if self.carrying else OBSTACLE_STOP_RANGE
+        drift apart onto two different numbers for the same state. While
+        carrying, this is computed live from self.cargo_half_extents (see
+        _cargo_extents_cb), not a fixed constant -- covers whatever's
+        actually on the plate, not just /Cube."""
+        if not self.carrying:
+            return OBSTACLE_STOP_RANGE
+        return CHASSIS_RADIUS + math.hypot(*self.cargo_half_extents)
 
     def _request_plan(self, goal_xy):
         if not self._plan_client.wait_for_server(timeout_sec=2.0):
@@ -813,8 +890,13 @@ class RotateDriveController(Node):
                 self._start_leg(turn_target=self.waypoints[0])
             return False
         elapsed = time.monotonic() - self.leg_start_time
-        ramp_in = min(1.0, elapsed / RAMP_TIME)
-        ramp_out = max(MIN_RAMP_OUT, min(1.0, abs(yaw_err) / DECEL_ANGLE))
+        ramp_time, decel_floor = RAMP_TIME, MIN_RAMP_OUT
+        if self.carrying:
+            t = self._carry_ramp_scale()
+            ramp_time = RAMP_TIME + t * (RAMP_TIME_LIGHT - RAMP_TIME)
+            decel_floor = min(decel_floor, MIN_RAMP_OUT - t * (MIN_RAMP_OUT - MIN_RAMP_OUT_LIGHT))
+        ramp_in = min(1.0, elapsed / ramp_time)
+        ramp_out = max(decel_floor, min(1.0, abs(yaw_err) / DECEL_ANGLE))
         speed = self.angular_speed * min(ramp_in, ramp_out)
         cmd = Twist()
         cmd.angular.z = speed if yaw_err > 0 else -speed
@@ -839,8 +921,13 @@ class RotateDriveController(Node):
                 self._start_leg(turn_target=self.waypoints[0])
             return False
         elapsed = time.monotonic() - self.leg_start_time
-        ramp_in = min(1.0, elapsed / RAMP_TIME)
+        ramp_time = RAMP_TIME
         floor = FINAL_APPROACH_MIN_RAMP_OUT if is_final else MIN_RAMP_OUT
+        if self.carrying:
+            t = self._carry_ramp_scale()
+            ramp_time = RAMP_TIME + t * (RAMP_TIME_LIGHT - RAMP_TIME)
+            floor = min(floor, MIN_RAMP_OUT - t * (MIN_RAMP_OUT - MIN_RAMP_OUT_LIGHT))
+        ramp_in = min(1.0, elapsed / ramp_time)
         ramp_out = max(floor, min(1.0, remaining / DECEL_DISTANCE))
         speed = LINEAR_SPEED * min(ramp_in, ramp_out)
         cmd = Twist()

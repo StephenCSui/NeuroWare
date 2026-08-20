@@ -27,7 +27,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 import math
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
@@ -79,6 +79,28 @@ ENTRY_CLEARANCE_DISTANCE = 1.0  # meters short of shelf 2's real target --
                         # on the shelf 2 side: a staging point to arrive at
                         # with obstacle checking still on, before the final
                         # obstacle-check-off entry leg into the shelf
+PICKUP_APPROACH_CLEARANCE_DISTANCE = EXIT_CLEARANCE_DISTANCE  # meters short
+                        # of the pickup object's real position, approached
+                        # from the corridor side -- mirrors ENTRY_CLEARANCE_
+                        # DISTANCE's role on the shelf-2 side (planner-routed
+                        # obstacle-checked staging point, then a short final
+                        # obstacle-check-off leg into the object itself), but
+                        # reuses EXIT_CLEARANCE_DISTANCE's value rather than
+                        # ENTRY_CLEARANCE_DISTANCE's: this staging point sits
+                        # on shelf 1's side, same real constraint
+                        # (clearance from shelf 1's own corner leg,
+                        # /World/Shelf/Cube_04) that EXIT_CLEARANCE_DISTANCE
+                        # was tuned against, just approached from the
+                        # opposite direction. Added because running transfers
+                        # back to back on one boot (no reboot between)
+                        # exposed a real bug: the old direct-mode-only
+                        # pickup leg has no obstacle check by design (its
+                        # target IS the object), so driving it unchecked
+                        # all the way from wherever the previous transfer
+                        # left the robot could -- and did, live -- run
+                        # straight through Cube_03's real collision geometry.
+                        # Not independently re-tuned per-object yet; to be
+                        # confirmed/adjusted from a live back-to-back run.
 SETTLE_VELOCITY_TOL = 0.05  # rad/s -- real wheel speed under this counts
                         # as stopped, not just commanded-to-stop
 SETTLE_TIMEOUT = 5.0   # generous -- the controller's own ramp should
@@ -177,6 +199,43 @@ def query_prim_odom_bbox_y(prim_path):
     raise TimeoutError(f"no scene dump response for {prim_path} within {QUERY_TIMEOUT}s")
 
 
+def query_prim_half_extents(prim_path):
+    """Real physical footprint half-extents (world-frame X/Y, meters) AND
+    real live mass (kg, PhysX-computed, not guessed) of prim_path, via the
+    same scene-dump mechanism as query_prim_odom_bbox_y -- world_bbox is
+    axis-aligned and world/odom differ only by a fixed rotation+translation,
+    so a bbox SIZE (max-min) is identical in either frame; only bbox
+    POSITION needs the odom conversion. Half-extents size
+    rotate_drive_controller.py's carry-obstacle clearance to whatever's
+    actually being carried; mass sizes its accel/decel ramp -- see
+    CARGO_EXTENTS_TOPIC below. Returns (half_x, half_y, mass_or_None) --
+    mass is None if the bridge couldn't determine it (e.g. no RigidBodyAPI),
+    not a guessed fallback value."""
+    import os
+    import re
+    if os.path.exists(SCENE_DUMP_RESPONSE_FILE):
+        os.remove(SCENE_DUMP_RESPONSE_FILE)
+    with open(SCENE_DUMP_FILE, "w") as f:
+        f.write(f"dump-{time.monotonic()}")
+    deadline = time.monotonic() + QUERY_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            with open(SCENE_DUMP_RESPONSE_FILE) as f:
+                content = f.read()
+            for line in content.splitlines():
+                if line.startswith(prim_path + " "):
+                    m = re.search(r"world_bbox=\(([-\d.]+),([-\d.]+),[-\d.]+\)-\(([-\d.]+),([-\d.]+),[-\d.]+\)", line)
+                    if m:
+                        x0, y0, x1, y1 = (float(m.group(i)) for i in (1, 2, 3, 4))
+                        mass_m = re.search(r"mass=([\d.]+)", line)
+                        mass = float(mass_m.group(1)) if mass_m else None
+                        return abs(x1 - x0) / 2.0, abs(y1 - y0) / 2.0, mass
+        except OSError:
+            pass
+        time.sleep(0.1)
+    raise TimeoutError(f"no scene dump response for {prim_path} within {QUERY_TIMEOUT}s")
+
+
 class ShelfTransferTask(Node):
     def __init__(self, object_prim, shelf2_prim):
         super().__init__("shelf_transfer_task")
@@ -185,6 +244,8 @@ class ShelfTransferTask(Node):
         self.nav_status = None
         self.chassis_yaw = 0.0
         self.have_chassis_yaw = False
+        self.cur_x = 0.0
+        self.cur_y = 0.0
         self._debug_markers = {}  # debug-vis: label -> (odom_x, odom_y), accumulated over the run
 
         status_qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE,
@@ -199,6 +260,11 @@ class ShelfTransferTask(Node):
         self.goal_carry_clear_direct_pub = self.create_publisher(PoseStamped, "/goal_pose_carry_clear_direct", 10)
         self.goal_carry_planned_pub = self.create_publisher(PoseStamped, "/goal_pose_carry_planned", 10)
         self.goal_correct_heading_pub = self.create_publisher(PoseStamped, "/goal_pose_correct_heading", 10)
+        # Real half-extents of whatever's actually on the plate, published
+        # once per run right after a confirmed lift -- rotate_drive_controller.py
+        # sizes its carry-obstacle clearance from this instead of a fixed
+        # /Cube-shaped constant, see query_prim_half_extents.
+        self.cargo_extents_pub = self.create_publisher(Point, "/cargo_extents", 10)
 
     def _status_cb(self, msg):
         self.nav_status = msg.data
@@ -207,6 +273,8 @@ class ShelfTransferTask(Node):
         q = msg.pose.pose.orientation
         self.chassis_yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         self.have_chassis_yaw = True
+        self.cur_x = msg.pose.pose.position.x
+        self.cur_y = msg.pose.pose.position.y
 
     def _write_debug_marker(self, label, x, y):
         # Best-effort only -- a failure here must never abort the actual
@@ -392,10 +460,32 @@ class ShelfTransferTask(Node):
         self.get_logger().info(
             f"{self.shelf2_prim} real footprint odom y=[{shelf2_y_min:.3f}, {shelf2_y_max:.3f}] -- targeting center y={shelf2_y:.3f}")
 
+        # Staging point short of the object, planner-routed with obstacle
+        # checking on -- mirrors the shelf-2 staging/entry split, see
+        # PICKUP_APPROACH_CLEARANCE_DISTANCE's comment for why this exists.
+        # Direction computed from the real current chassis position, not
+        # assumed -- this leg has to work whether the robot is starting
+        # fresh at spawn or arriving from a just-completed transfer on the
+        # opposite side.
+        if not self.have_chassis_yaw:
+            self.get_logger().error("no /odom received yet -- cannot compute pickup approach staging point")
+            return False
+        approach_direction = 1.0 if obj_y > self.cur_y else -1.0
+        staging_x, staging_y = obj_x, obj_y - approach_direction * PICKUP_APPROACH_CLEARANCE_DISTANCE
+        self._write_debug_marker("shelf1_approach", staging_x, staging_y)
+        self.get_logger().info(f"approaching shelf 1 staging point ({staging_x:.3f}, {staging_y:.3f}) -- collision avoidance active...")
+        if not self.send_goal_and_wait(staging_x, staging_y, mode="approach"):
+            self.get_logger().error("never reached the shelf 1 approach staging point -- aborting")
+            return False
+        self._settle_pause()
+
         self.get_logger().info("driving to pickup point (direct, no planning)...")
         # Direct mode: a single turn-to-exact-bearing-then-drive-straight
         # leg (no planner routing, no obstacle check), matching
-        # two_robot_pickup_demo.py's original run_goto exactly.
+        # two_robot_pickup_demo.py's original run_goto exactly. Safe now --
+        # this only ever starts from the staging point above, a short,
+        # known-clear distance from the object, not from an arbitrary
+        # prior position.
         if not self.send_goal_and_wait(obj_x, obj_y, mode="direct"):
             self.get_logger().error("never reached the pickup point -- aborting")
             return False
@@ -405,9 +495,31 @@ class ShelfTransferTask(Node):
         if not self.piston_command(f"lift:{self.object_prim}", "lifted"):
             self.get_logger().error("lift never completed -- aborting")
             return False
+        # Settle pause before checking attachment -- every other step in
+        # this run() confirms-then-pauses before the next check; this one
+        # didn't, and a live chained-run test caught it: cargo_attached()
+        # was being read the instant "lifted" appeared, sometimes racing
+        # ahead of the bridge's own attachment-status write for that same
+        # tick (confirmed live -- /Cylinder read "not attached" here, but
+        # both PISTON_STATUS_FILE and CARGO_STATUS_FILE showed correct,
+        # fully-attached state moments later with no drop ever logged).
+        self._settle_pause()
         if not self.cargo_attached():
             self.get_logger().error(f"{self.object_prim} is not on the plate after lift -- aborting")
             return False
+
+        self.get_logger().info(f"querying {self.object_prim} real footprint (bbox half-extents) and mass...")
+        half_x, half_y, mass = query_prim_half_extents(self.object_prim)
+        self.get_logger().info(f"{self.object_prim} half-extents=({half_x:.4f}, {half_y:.4f}) mass={mass} -- publishing to rotate_drive_controller.py")
+        extents_msg = Point()
+        extents_msg.x, extents_msg.y = half_x, half_y
+        # z = real mass (kg), used to scale accel/decel ramp for carry legs
+        # -- see rotate_drive_controller.py's _cargo_extents_cb. 0.0 (not
+        # None -- Point.z is a plain float64) when the bridge couldn't
+        # determine a real mass; the controller falls back to its own
+        # default rather than treating 0.0 as "massless."
+        extents_msg.z = mass if mass is not None else 0.0
+        self.cargo_extents_pub.publish(extents_msg)
         self._settle_pause()
 
         # Explicit two-step exit, per direct user correction this session:
